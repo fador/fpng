@@ -133,8 +133,19 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
 
         if (use_ga) {
             // === Genetic Algorithm ===
-            const int POP = opts.ga_population;
-            const int GENS = opts.ga_generations;
+            // Auto-scale population based on image size
+            int POP = opts.ga_population;
+            int GENS = opts.ga_generations;
+            if (height < 64) {
+                POP = std::min(POP, 10);
+                GENS = std::min(GENS, 15);
+            } else if (height < 256) {
+                POP = std::min(POP, 20);
+                GENS = std::min(GENS, 30);
+            } else {
+                POP = std::min(POP, 30);
+                GENS = std::min(GENS, 50);
+            }
             const int ELITE = std::max(1, POP / 10);
 
             struct Individual {
@@ -156,7 +167,7 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                     std::memcpy(prev.data(), src, raw_ss);
                 }
                 DeflateOptions dopts;
-                dopts.level = CompressionLevel::Store; // fast proxy
+                dopts.level = CompressionLevel::Fast; // fast but uses actual LZ77+Huffman
                 return deflate_compress(filtered, dopts).size();
             };
 
@@ -299,7 +310,7 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                     std::memcpy(prev.data(), src, raw_ss);
                 }
                 DeflateOptions dopts;
-                dopts.level = CompressionLevel::Store;
+                dopts.level = CompressionLevel::Fast;
                 return deflate_compress(filtered, dopts).size();
             };
 
