@@ -88,8 +88,28 @@ int main(int argc, char** argv) {
     auto result = fpng::compress(img, opts);
     double comp_time = comp_timer.elapsed_seconds();
 
-    // Write
-    fpng::write_file(output_path, result.data);
+    // Determine output: keep original if compressed is larger
+    size_t orig_file_size = 0;
+    try { orig_file_size = std::filesystem::file_size(input_path); }
+    catch (...) {}
+
+    size_t out_size = result.data.size();
+    bool wrote = false;
+
+    if (orig_file_size > 0 && out_size >= orig_file_size) {
+        // Compressed version is not smaller
+        if (opts.verbose)
+            std::cout << "Compressed output not smaller (" << out_size 
+                      << " >= " << orig_file_size << "), keeping original\n";
+        if (input_path != output_path) {
+            // Copy original to output if paths differ
+            std::filesystem::copy_file(input_path, output_path,
+                std::filesystem::copy_options::overwrite_existing);
+        }
+    } else {
+        fpng::write_file(output_path, result.data);
+        wrote = true;
+    }
 
     double total_time = total_timer.elapsed_seconds();
 
@@ -98,17 +118,21 @@ int main(int argc, char** argv) {
         std::cout << "Compression: " << comp_time << "s\n";
     }
 
-    size_t orig_size = result.original_size;
-    size_t out_size = result.data.size();
-    if (orig_size > 0) {
-        double ratio = 100.0 * (1.0 - static_cast<double>(out_size) / orig_size);
-        std::cout << "Wrote: " << output_path
-                  << " (" << out_size << " bytes, "
-                  << ratio << "% saved)"
-                  << " in " << total_time << "s\n";
+    if (wrote) {
+        if (orig_file_size > 0) {
+            double ratio = 100.0 * (1.0 - static_cast<double>(out_size) / orig_file_size);
+            std::cout << "Wrote: " << output_path
+                      << " (" << out_size << " bytes, "
+                      << ratio << "% saved)"
+                      << " in " << total_time << "s\n";
+        } else {
+            std::cout << "Wrote: " << output_path
+                      << " (" << out_size << " bytes)"
+                      << " in " << total_time << "s\n";
+        }
     } else {
-        std::cout << "Wrote: " << output_path
-                  << " (" << out_size << " bytes)"
+        std::cout << "Kept: " << output_path
+                  << " (" << orig_file_size << " bytes, already optimal)"
                   << " in " << total_time << "s\n";
     }
 
