@@ -233,7 +233,8 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img) {
     } else {
         // Optimize filter selection
         FilterOptions fopts;
-        fopts.level = 1;
+        fopts.level = 2;  // entropy-based, fast
+        fopts.window_size = 2;
         auto filters = optimize_filters(img, fopts);
 
         std::vector<uint8_t> prev_scanline(raw_ss, 0);

@@ -1,4 +1,5 @@
 #include "compress/deflate/lz77.hpp"
+#include "compress/deflate/match_finder.hpp"
 
 #include <cstring>
 #include <algorithm>
@@ -49,9 +50,8 @@ LZMatch MatchFinder::find_longest(size_t pos, int min_len) const {
 
         // Quick check on first min_len bytes
         if (cand[0] == cur[0] && cand[1] == cur[1] && cand[2] == cur[2]) {
-            size_t match_len = min_len;
-            while (match_len < max_match && cand[match_len] == cur[match_len])
-                ++match_len;
+            size_t match_len = simd::match_length(cand + min_len, cur + min_len,
+                                                   max_match - min_len) + min_len;
 
             if (match_len > best.length) {
                 best.length = static_cast<uint16_t>(match_len);
@@ -88,9 +88,8 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
         const uint8_t* cand = data_ + candidate;
 
         if (cand[0] == cur[0] && cand[1] == cur[1] && cand[2] == cur[2]) {
-            size_t match_len = min_len;
-            while (match_len < max_match && cand[match_len] == cur[match_len])
-                ++match_len;
+            size_t match_len = simd::match_length(cand + min_len, cur + min_len,
+                                                   max_match - min_len) + min_len;
             if (match_len >= static_cast<size_t>(min_len)) {
                 matches.push_back({
                     static_cast<uint16_t>(match_len),
