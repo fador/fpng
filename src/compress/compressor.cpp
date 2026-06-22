@@ -41,7 +41,7 @@ std::vector<Strategy> get_strategies(int level) {
         return strategies;
     }
 
-    // Maximum: try many strategies
+    // Maximum: try many strategies including GA filter optimization
     strategies.push_back({2, CompressionLevel::Default, 1, true, false,  "max-01"});
     strategies.push_back({2, CompressionLevel::Best, 1, true, false,     "max-02"});
     strategies.push_back({2, CompressionLevel::Best, 2, true, false,     "max-03"});
@@ -57,6 +57,13 @@ std::vector<Strategy> get_strategies(int level) {
     // Palette-sort variants
     strategies.push_back({2, CompressionLevel::Best, 2, true, true,      "max-10"});
     strategies.push_back({3, CompressionLevel::Ultra, 3, true, true,     "max-11"});
+
+    // GA filter optimization (high-effort)
+    strategies.push_back({5, CompressionLevel::Best, 2, true, false,     "max-12"});
+    strategies.push_back({7, CompressionLevel::Best, 2, true, false,     "max-13"});
+    strategies.push_back({7, CompressionLevel::Ultra, 3, true, false,    "max-14"});
+
+    return strategies;
 
     return strategies;
 }

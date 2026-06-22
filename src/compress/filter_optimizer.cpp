@@ -9,6 +9,7 @@
 #include <numeric>
 #include <map>
 #include <array>
+#include <random>
 
 namespace fpng {
 
@@ -127,15 +128,43 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
             std::memcpy(prev.data(), src, raw_ss);
         }
     } else {
-        // DP with K-state limited window (levels 5-7)
-        // State = last K filter choices. K = min(opts.window_size, 3)
-        int K = std::min(std::max(1, opts.window_size), 3);
-        size_t num_states = 1;
-        for (int i = 0; i < K; ++i) num_states *= 5; // 5^K
+        // Hill-climbing with restarts (levels 5-6) or Genetic Algorithm (level 7+ or forced)
+        bool use_ga = (opts.level >= 7) || opts.use_genetic;
 
-        if (height <= static_cast<size_t>(K)) {
-            // Too small for DP, fall back to entropy
-            std::vector<uint8_t> prev(raw_ss, 0);
+        if (use_ga) {
+            // === Genetic Algorithm ===
+            const int POP = opts.ga_population;
+            const int GENS = opts.ga_generations;
+            const int ELITE = std::max(1, POP / 10);
+
+            struct Individual {
+                std::vector<FilterType> filters;
+                size_t compressed_size = std::numeric_limits<size_t>::max();
+            };
+
+            // Fitness: compress image with these filters, return size
+            auto fitness = [&](const std::vector<FilterType>& filters) -> size_t {
+                std::vector<uint8_t> filtered;
+                std::vector<uint8_t> prev(raw_ss, 0);
+                for (size_t y = 0; y < height; ++y) {
+                    const uint8_t* src = img.pixels.data() + y * raw_ss;
+                    std::vector<uint8_t> row(raw_ss + 1);
+                    FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
+                    filter_scanline(ft, src, row.data(), bpp, raw_ss,
+                                     y > 0 ? prev.data() : nullptr);
+                    filtered.insert(filtered.end(), row.begin(), row.end());
+                    std::memcpy(prev.data(), src, raw_ss);
+                }
+                DeflateOptions dopts;
+                dopts.level = CompressionLevel::Store; // fast proxy
+                return deflate_compress(filtered, dopts).size();
+            };
+
+            // Initialize population
+            std::vector<Individual> pop(POP);
+
+            // Seed 1: entropy-based heuristic
+            std::vector<uint8_t> prev_h(raw_ss, 0);
             for (size_t y = 0; y < height; ++y) {
                 const uint8_t* src = img.pixels.data() + y * raw_ss;
                 FilterType best = FilterType::None;
@@ -143,138 +172,197 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                 for (int ft = 0; ft <= 4; ++ft) {
                     auto type = static_cast<FilterType>(ft);
                     double cost = filter_cost(type, src, raw_ss, bpp,
-                                               y > 0 ? prev.data() : nullptr);
+                                               y > 0 ? prev_h.data() : nullptr);
                     if (cost < best_cost) { best_cost = cost; best = type; }
                 }
-                result[y] = best;
-                std::memcpy(prev.data(), src, raw_ss);
+                pop[0].filters.push_back(best);
+                std::memcpy(prev_h.data(), src, raw_ss);
             }
-            return result;
-        }
+            pop[0].compressed_size = fitness(pop[0].filters);
 
-        // Precompute all filter encodings for each row
-        // filtered[row][filter] = filtered row data
-        std::vector<std::array<std::vector<uint8_t>, 5>> filtered_rows(height);
-        std::vector<uint8_t> prev(raw_ss, 0);
+            // Seeds 2-3: all None, all Paeth
+            pop[1].filters.assign(height, FilterType::None);
+            pop[1].compressed_size = fitness(pop[1].filters);
+            pop[2].filters.assign(height, FilterType::Paeth);
+            pop[2].compressed_size = fitness(pop[2].filters);
 
-        for (size_t y = 0; y < height; ++y) {
-            const uint8_t* src = img.pixels.data() + y * raw_ss;
-            for (int ft = 0; ft <= 4; ++ft) {
-                auto type = static_cast<FilterType>(ft);
-                filtered_rows[y][ft].resize(raw_ss + 1);
-                filter_scanline(type, src, filtered_rows[y][ft].data(), bpp, raw_ss,
-                                 y > 0 ? prev.data() : nullptr);
+            // Seeds 4-N: random perturbations of the heuristic solution
+            std::mt19937 rng(42);
+            for (int p = 3; p < POP; ++p) {
+                pop[p].filters = pop[0].filters;
+                int flips = static_cast<int>(height) / 10 + 2;
+                for (int f = 0; f < flips; ++f) {
+                    size_t row = rng() % height;
+                    pop[p].filters[row] = static_cast<FilterType>(rng() % 5);
+                }
+                pop[p].compressed_size = fitness(pop[p].filters);
             }
-            std::memcpy(prev.data(), src, raw_ss);
-        }
 
-        // DP: dp[row][state] = minimum compressed size for rows 0..row
-        // ending with the last K filters forming 'state'
-        // state encoding: state = f[0] + f[1]*5 + f[2]*25 + ...
-        std::vector<uint64_t> dp_prev(num_states, std::numeric_limits<uint64_t>::max());
-        std::vector<uint64_t> dp_curr;
-        std::vector<std::pair<int, int>> backtrack(height); // (prev_state, filter) for each row
+            // Sort by fitness
+            std::sort(pop.begin(), pop.end(),
+                [](const Individual& a, const Individual& b) {
+                    return a.compressed_size < b.compressed_size;
+                });
 
-        // Initialize: row 0, state uses only the first filter
-        for (int f0 = 0; f0 <= 4; ++f0) {
-            size_t state = f0;
-            std::vector<uint8_t> trial;
-            for (size_t r = 0; r <= 0; ++r)
-                trial.insert(trial.end(), filtered_rows[r][f0].begin(), filtered_rows[r][f0].end());
-            dp_prev[state] = trial_compress_size(trial);
-        }
+            size_t best_overall = pop[0].compressed_size;
 
-        // For rows 1..height-1
-        auto state_decode = [K](size_t state, std::vector<int>& filters) {
-            filters.resize(K);
-            for (int i = 0; i < K; ++i) {
-                filters[i] = static_cast<int>(state % 5);
-                state /= 5;
-            }
-        };
+            // Evolution loop
+            for (int gen = 0; gen < GENS; ++gen) {
+                std::vector<Individual> next;
+                next.reserve(POP);
 
-        auto state_encode = [](const std::vector<int>& filters) -> size_t {
-            size_t s = 0, mul = 1;
-            for (int f : filters) { s += f * mul; mul *= 5; }
-            return s;
-        };
+                // Elitism
+                for (int e = 0; e < ELITE; ++e)
+                    next.push_back(pop[e]);
 
-        for (size_t y = 1; y < height; ++y) {
-            dp_curr.assign(num_states, std::numeric_limits<uint64_t>::max());
+                // Crossover + mutation
+                while (static_cast<int>(next.size()) < POP) {
+                    // Tournament selection (pick 3, best wins)
+                    int t1 = rng() % POP, t2 = rng() % POP, t3 = rng() % POP;
+                    int p1 = std::min({t1, t2, t3}, [&](int a, int b) {
+                        return pop[a].compressed_size < pop[b].compressed_size; });
+                    t1 = rng() % POP; t2 = rng() % POP; t3 = rng() % POP;
+                    int p2 = std::min({t1, t2, t3}, [&](int a, int b) {
+                        return pop[a].compressed_size < pop[b].compressed_size; });
 
-            for (size_t prev_state = 0; prev_state < num_states; ++prev_state) {
-                if (dp_prev[prev_state] == std::numeric_limits<uint64_t>::max()) continue;
-
-                std::vector<int> prev_filters;
-                state_decode(prev_state, prev_filters);
-
-                for (int f = 0; f <= 4; ++f) {
-                    // New state: shift left and add new filter
-                    std::vector<int> new_filters = prev_filters;
-                    for (int i = K - 1; i > 0; --i) new_filters[i] = new_filters[i - 1];
-                    new_filters[0] = f;
-                    size_t new_state = state_encode(new_filters);
-
-                    // Cost: compress rows y-K+1 to y with these filters
-                    // Only need to add the cost of the new row y with filter f
-                    // But we must account for the prev row data which depends on
-                    // the real prev scanline. For simplicity, we compress the last
-                    // K+1 rows (or all rows up to y) in each trial.
-                    std::vector<uint8_t> trial;
-                    int start = std::max(0, static_cast<int>(y) - K);
-                    for (int r = start; r <= static_cast<int>(y); ++r) {
-                        int idx = static_cast<int>(y) - r;
-                        int filt = (idx < K) ? new_filters[idx] : prev_filters[idx - K];
-                        filt = std::min(std::max(filt, 0), 4);
-                        trial.insert(trial.end(),
-                                     filtered_rows[r][filt].begin(),
-                                     filtered_rows[r][filt].end());
+                    // Uniform crossover
+                    Individual child;
+                    child.filters.resize(height);
+                    for (size_t r = 0; r < height; ++r) {
+                        child.filters[r] = (rng() & 1) ?
+                            pop[p1].filters[r] : pop[p2].filters[r];
                     }
 
-                    uint64_t trial_cost = trial_compress_size(trial);
-                    if (trial_cost < dp_curr[new_state]) {
-                        dp_curr[new_state] = trial_cost;
-                        // Store backtrack: at row y, state new_state came from
-                        // prev_state with new filter f.
-                        // We encode as: (f << 0) | (prev_state << 3)
+                    // Mutation: flip ~5% of rows, with local bursts
+                    double mut_rate = 0.05;
+                    if (gen > GENS / 2) mut_rate = 0.02; // reduce later
+
+                    for (size_t r = 0; r < height; ++r) {
+                        if ((rng() % 1000) < static_cast<int>(mut_rate * 1000)) {
+                            // Local burst: flip this and nearby rows
+                            int burst = (rng() % 3) + 1;
+                            for (int b = 0; b < burst; ++b) {
+                                size_t rr = r + b;
+                                if (rr < height)
+                                    child.filters[rr] = static_cast<FilterType>(rng() % 5);
+                            }
+                        }
                     }
+
+                    child.compressed_size = fitness(child.filters);
+                    next.push_back(std::move(child));
+                }
+
+                pop = std::move(next);
+                std::sort(pop.begin(), pop.end(),
+                    [](const Individual& a, const Individual& b) {
+                        return a.compressed_size < b.compressed_size;
+                    });
+
+                if (pop[0].compressed_size < best_overall) {
+                    best_overall = pop[0].compressed_size;
+                }
+
+                // Early termination if no improvement for 20 generations
+                if (gen > 20 && gen % 10 == 0) {
+                    bool improved = false;
+                    for (int i = 0; i < ELITE; ++i) {
+                        if (pop[i].compressed_size < best_overall * 0.99) {
+                            improved = true; break;
+                        }
+                    }
+                    if (!improved && pop[0].compressed_size <= best_overall) break;
                 }
             }
 
-            dp_prev.swap(dp_curr);
-        }
+            result = pop[0].filters;
 
-        // Backtrack: find best final state
-        size_t best_state = 0;
-        uint64_t best_final = std::numeric_limits<uint64_t>::max();
-        for (size_t s = 0; s < num_states; ++s) {
-            if (dp_prev[s] < best_final) {
-                best_final = dp_prev[s];
-                best_state = s;
+        } else {
+            // === Stochastic hill-climbing with restarts (levels 5-6) ===
+            const int RESTARTS = 5;
+            const int MAX_STEPS = static_cast<int>(height) * 3;
+
+            std::mt19937 rng(42);
+            std::vector<FilterType> best_filters;
+            size_t best_size = std::numeric_limits<size_t>::max();
+
+            auto fitness_hc = [&](const std::vector<FilterType>& filters) -> size_t {
+                std::vector<uint8_t> filtered;
+                std::vector<uint8_t> prev(raw_ss, 0);
+                for (size_t y = 0; y < height; ++y) {
+                    const uint8_t* src = img.pixels.data() + y * raw_ss;
+                    std::vector<uint8_t> row(raw_ss + 1);
+                    FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
+                    filter_scanline(ft, src, row.data(), bpp, raw_ss,
+                                     y > 0 ? prev.data() : nullptr);
+                    filtered.insert(filtered.end(), row.begin(), row.end());
+                    std::memcpy(prev.data(), src, raw_ss);
+                }
+                DeflateOptions dopts;
+                dopts.level = CompressionLevel::Store;
+                return deflate_compress(filtered, dopts).size();
+            };
+
+            // Initial solutions to try
+            std::vector<std::vector<FilterType>> initials;
+
+            // Entropy heuristic
+            {
+                std::vector<FilterType> f;
+                std::vector<uint8_t> prev_h(raw_ss, 0);
+                for (size_t y = 0; y < height; ++y) {
+                    const uint8_t* src = img.pixels.data() + y * raw_ss;
+                    FilterType best = FilterType::None;
+                    double best_cost = std::numeric_limits<double>::max();
+                    for (int ft = 0; ft <= 4; ++ft) {
+                        auto type = static_cast<FilterType>(ft);
+                        double cost = filter_cost(type, src, raw_ss, bpp,
+                                                   y > 0 ? prev_h.data() : nullptr);
+                        if (cost < best_cost) { best_cost = cost; best = type; }
+                    }
+                    f.push_back(best);
+                    std::memcpy(prev_h.data(), src, raw_ss);
+                }
+                initials.push_back(f);
             }
-        }
 
-        // Decode the best path (simplified: just use the last filter from best_state)
-        std::vector<int> final_filters;
-        state_decode(best_state, final_filters);
-        result[height - 1] = static_cast<FilterType>(final_filters[0]);
+            // All None
+            initials.push_back(std::vector<FilterType>(height, FilterType::None));
+            // All Paeth
+            initials.push_back(std::vector<FilterType>(height, FilterType::Paeth));
+            // All Up
+            initials.push_back(std::vector<FilterType>(height, FilterType::Up));
 
-        // For simplicity on other rows, use entropy-based fallback
-        // (Full DP backtrack would require storing all intermediate states,
-        //  which is memory-intensive for large images.)
-        // For the remaining rows, compute heuristically using the known
-        // last filter choice as context.
-        for (size_t y = 0; y + 1 < height; ++y) {
-            const uint8_t* src = img.pixels.data() + y * raw_ss;
-            FilterType best = FilterType::None;
-            double best_cost = std::numeric_limits<double>::max();
-            for (int ft = 0; ft <= 4; ++ft) {
-                auto type = static_cast<FilterType>(ft);
-                double cost = filter_cost(type, src, raw_ss, bpp,
-                                           y > 0 ? img.pixels.data() + (y-1)*raw_ss : nullptr);
-                if (cost < best_cost) { best_cost = cost; best = type; }
+            for (auto& current : initials) {
+                size_t current_size = fitness_hc(current);
+
+                // Hill climb
+                int steps_without_improvement = 0;
+                for (int step = 0; step < MAX_STEPS && steps_without_improvement < 50; ++step) {
+                    // Try flipping a random contiguous block of rows
+                    size_t start = rng() % height;
+                    size_t count = (rng() % std::min(size_t(5), height - start)) + 1;
+                    std::vector<FilterType> neighbor = current;
+                    for (size_t r = start; r < start + count && r < height; ++r)
+                        neighbor[r] = static_cast<FilterType>(rng() % 5);
+
+                    size_t neighbor_size = fitness_hc(neighbor);
+                    if (neighbor_size < current_size) {
+                        current = std::move(neighbor);
+                        current_size = neighbor_size;
+                        steps_without_improvement = 0;
+                    } else {
+                        ++steps_without_improvement;
+                    }
+                }
+
+                if (current_size < best_size) {
+                    best_size = current_size;
+                    best_filters = std::move(current);
+                }
             }
-            result[y] = best;
+
+            result = best_filters;
         }
     }
 
