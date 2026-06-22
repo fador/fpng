@@ -288,6 +288,36 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
 
             result = pop[0].filters;
 
+            // Re-evaluate top 3 GA winners with actual dynamic Huffman compression
+            // (GA uses fast deflate as proxy, which may not correlate perfectly)
+            {
+                auto fitness_real = [&](const std::vector<FilterType>& filters) -> size_t {
+                    std::vector<uint8_t> filtered;
+                    std::vector<uint8_t> prev(raw_ss, 0);
+                    for (size_t y = 0; y < height; ++y) {
+                        const uint8_t* src = img.pixels.data() + y * raw_ss;
+                        std::vector<uint8_t> row(raw_ss + 1);
+                        FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
+                        filter_scanline(ft, src, row.data(), bpp, raw_ss,
+                                         y > 0 ? prev.data() : nullptr);
+                        filtered.insert(filtered.end(), row.begin(), row.end());
+                        std::memcpy(prev.data(), src, raw_ss);
+                    }
+                    DeflateOptions dopts;
+                    dopts.level = CompressionLevel::Default; // dynamic Huffman
+                    return deflate_compress(filtered, dopts).size();
+                };
+
+                size_t best_real = fitness_real(result);
+                for (int i = 1; i < std::min(POP, 5); ++i) {
+                    size_t sz = fitness_real(pop[i].filters);
+                    if (sz < best_real) {
+                        best_real = sz;
+                        result = pop[i].filters;
+                    }
+                }
+            }
+
         } else {
             // === Stochastic hill-climbing with restarts (levels 5-6) ===
             const int RESTARTS = 5;
@@ -343,6 +373,32 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
             initials.push_back(std::vector<FilterType>(height, FilterType::Paeth));
             // All Up
             initials.push_back(std::vector<FilterType>(height, FilterType::Up));
+            // All Average
+            initials.push_back(std::vector<FilterType>(height, FilterType::Average));
+            // All Sub
+            initials.push_back(std::vector<FilterType>(height, FilterType::Sub));
+
+            // MinSum heuristic
+            {
+                std::vector<FilterType> f;
+                std::vector<uint8_t> prev_i(raw_ss, 0);
+                for (size_t y = 0; y < height; ++y) {
+                    const uint8_t* src = img.pixels.data() + y * raw_ss;
+                    std::vector<uint8_t> row(raw_ss + 1);
+                    FilterType best = FilterType::None;
+                    uint64_t best_cost = std::numeric_limits<uint64_t>::max();
+                    for (int ft = 0; ft <= 4; ++ft) {
+                        auto type = static_cast<FilterType>(ft);
+                        filter_scanline(type, src, row.data(), bpp, raw_ss,
+                                         y > 0 ? prev_i.data() : nullptr);
+                        uint64_t cost = sum_abs(row.data() + 1, raw_ss);
+                        if (cost < best_cost) { best_cost = cost; best = type; }
+                    }
+                    f.push_back(best);
+                    std::memcpy(prev_i.data(), src, raw_ss);
+                }
+                initials.push_back(f);
+            }
 
             for (auto& current : initials) {
                 size_t current_size = fitness_hc(current);

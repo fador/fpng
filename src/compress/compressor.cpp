@@ -67,6 +67,20 @@ std::vector<Strategy> get_strategies(int level) {
     strategies.push_back({2, CompressionLevel::Best, 2, true, false, true,  "max-15"});
     strategies.push_back({3, CompressionLevel::Ultra, 3, true, false, true, "max-16"});
 
+    // Zopfli-style: multi-iteration refinement (4-5 passes)
+    // Each pass rebuilds Huffman and re-parses with refined costs
+    strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, false, "max-17"});
+    strategies.push_back({3, CompressionLevel::Ultra, 4, true, false, false, "max-18"});
+    strategies.push_back({2, CompressionLevel::Ultra, 5, true, false, false, "max-19"});
+    strategies.push_back({3, CompressionLevel::Ultra, 5, true, false, false, "max-20"});
+
+    // Combined: BT match finder + high iterations + high filter
+    strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, true,  "max-21"});
+    strategies.push_back({3, CompressionLevel::Ultra, 5, true, false, true,  "max-22"});
+
+    // Pure quality: GA filter + BT match + max iterations
+    strategies.push_back({7, CompressionLevel::Ultra, 5, true, false, true,  "max-23"});
+
     return strategies;
 }
 
