@@ -127,24 +127,41 @@ struct HuffmanTree {
         if (max_code_len == 0)
             throw std::runtime_error("inflate: empty huffman tree");
 
-        while (br.bits_in_buf < max_code_len) {
-            if (br.byte_pos >= br.size)
-                throw std::runtime_error("inflate: unexpected EOF");
-            br.bit_buf |= static_cast<uint64_t>(br.data[br.byte_pos++]) << br.bits_in_buf;
-            br.bits_in_buf += 8;
+        // Accumulate bits until we find a matching code.
+        // Since codes are prefix-free, we can check at each bit length.
+        int code = 0;
+        for (int len = 1; len <= max_code_len; ++len) {
+            // Ensure we have at least one more bit
+            if (br.bits_in_buf == 0) {
+                if (br.byte_pos >= br.size)
+                    throw std::runtime_error("inflate: unexpected EOF");
+                br.bit_buf |= static_cast<uint64_t>(br.data[br.byte_pos++]) << br.bits_in_buf;
+                br.bits_in_buf = 8;
+            }
+            // Accumulate one bit (LSB of bit_buf becomes the LSB of code)
+            code = (code >> 1) | (static_cast<int>(br.bit_buf & 1) << (max_code_len - 1));
+            br.bit_buf >>= 1;
+            --br.bits_in_buf;
+
+            // Check lookup table: the bits we've read so far (len bits, LSB-first)
+            // are stored at position (len_bits_as_lsb) in the table, padded with
+            // any remaining buffered bits
+            int remaining = max_code_len - len;
+            int suffix = 0;
+            if (remaining > 0 && br.bits_in_buf > 0) {
+                suffix = static_cast<int>(br.bit_buf & ((1u << std::min(remaining, br.bits_in_buf)) - 1));
+            }
+            // Build the lookup index: first len bits are in code (LSB-first), 
+            // remaining bits are suffix
+            int idx = (code >> (max_code_len - len)) | (suffix << len);
+            uint32_t entry = lookup[idx];
+            int entry_len = static_cast<int>(entry >> 12);
+            if (entry_len == len) {
+                return (entry & 0xfff) - 1;
+            }
         }
 
-        int code = static_cast<int>(br.bit_buf & ((1u << max_code_len) - 1));
-        uint32_t entry = lookup[static_cast<size_t>(code)];
-        int len = static_cast<int>(entry >> 12);
-        int sym = static_cast<int>(entry & 0xfff) - 1;
-
-        if (len <= 0 || len > max_code_len || sym < 0)
-            throw std::runtime_error("inflate: invalid huffman code");
-
-        br.bit_buf >>= len;
-        br.bits_in_buf -= len;
-        return sym;
+        throw std::runtime_error("inflate: invalid huffman code");
     }
 };
 
