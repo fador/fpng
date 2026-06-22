@@ -120,8 +120,9 @@ void PNGWriter::write_apng_chunks(std::vector<uint8_t>& out, const Image& img) {
     }
 }
 
-void PNGWriter::write_idat(std::vector<uint8_t>& out, const Image& img) {
-    auto compressed = filter_and_compress(img);
+void PNGWriter::write_idat(std::vector<uint8_t>& out, const Image& img,
+                             const WriteOptions& wopts) {
+    auto compressed = filter_and_compress(img, wopts);
     write_chunk(out, "IDAT", compressed);
 
     // Write additional frames as fdAT chunks
@@ -159,7 +160,8 @@ void PNGWriter::write_iend(std::vector<uint8_t>& out) {
     write_chunk(out, "IEND", {});
 }
 
-std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img) {
+std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img,
+                                                    const WriteOptions& wopts) {
     if (img.pixels.empty()) return {};
 
     size_t raw_ss = img.raw_scanline_size();
@@ -169,8 +171,15 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img) {
     std::vector<uint8_t> filtered;
     filtered.reserve((raw_ss + 1) * height);
 
+    // Get filters: use provided ones if available, else auto-compute
+    std::vector<FilterType> filters = wopts.filters;
+    if (filters.empty()) {
+        FilterOptions fopts;
+        fopts.level = 2;
+        filters = optimize_filters(img, fopts);
+    }
+
     if (img.interlaced) {
-        // Adam7 interlacing
         struct { uint32_t x0, y0, dx, dy; } passes[7] = {
             {0,0,8,8}, {4,0,8,8}, {0,4,4,8}, {2,0,4,4}, {0,2,2,4}, {1,0,2,2}, {0,1,1,2}
         };
@@ -231,12 +240,6 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img) {
             }
         }
     } else {
-        // Optimize filter selection
-        FilterOptions fopts;
-        fopts.level = 2;  // entropy-based, fast
-        fopts.window_size = 2;
-        auto filters = optimize_filters(img, fopts);
-
         std::vector<uint8_t> prev_scanline(raw_ss, 0);
         for (size_t y = 0; y < height; ++y) {
             const uint8_t* src = img.pixels.data() + y * raw_ss;
@@ -249,7 +252,7 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img) {
         }
     }
 
-    return zlib_compress(filtered);
+    return zlib_compress(filtered, wopts.deflate);
 }
 
 std::vector<uint8_t> PNGWriter::filter_and_compress_frame(const Image& img,
@@ -279,7 +282,8 @@ std::vector<uint8_t> PNGWriter::filter_and_compress_frame(const Image& img,
     return zlib_compress(filtered);
 }
 
-std::vector<uint8_t> PNGWriter::write(const Image& img) {
+std::vector<uint8_t> PNGWriter::write(const Image& img,
+                                       const WriteOptions& wopts) {
     std::vector<uint8_t> out;
     write_signature(out);
     write_ihdr(out, img);
@@ -287,13 +291,14 @@ std::vector<uint8_t> PNGWriter::write(const Image& img) {
     write_plte(out, img);
     write_trns(out, img);
     write_apng_chunks(out, img);
-    write_idat(out, img);
+    write_idat(out, img, wopts);
     write_iend(out);
     return out;
 }
 
-bool PNGWriter::write(const std::filesystem::path& path, const Image& img) {
-    auto data = write(img);
+bool PNGWriter::write(const std::filesystem::path& path, const Image& img,
+                       const WriteOptions& wopts) {
+    auto data = write(img, wopts);
     return write_file(path, data);
 }
 
