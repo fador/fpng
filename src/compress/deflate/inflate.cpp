@@ -61,23 +61,36 @@ struct BitReader {
     }
 };
 
-// Canonical Huffman tree with sorted symbol lookup
+// Canonical Huffman tree with lookup table for fast decoding
 struct HuffmanTree {
-    struct Entry {
-        uint16_t code;
-        uint8_t  bits;
-        uint16_t symbol;
-    };
+    std::vector<uint32_t> lookup;
+    int max_code_len = 0;
 
-    std::vector<Entry> entries;
+    static uint32_t reverse_bits(uint32_t v, int num_bits) noexcept {
+        uint32_t r = 0;
+        for (int i = 0; i < num_bits; ++i) {
+            r = (r << 1) | (v & 1);
+            v >>= 1;
+        }
+        return r;
+    }
 
     void build(const int* lengths, int num_syms) {
-        // Count lengths
         int bl_count[MAX_BITS + 1] = {};
-        for (int i = 0; i < num_syms; ++i)
-            if (lengths[i] > 0) bl_count[lengths[i]]++;
+        max_code_len = 0;
+        for (int i = 0; i < num_syms; ++i) {
+            if (lengths[i] > 0) {
+                bl_count[lengths[i]]++;
+                if (lengths[i] > max_code_len) max_code_len = lengths[i];
+            }
+        }
+        bl_count[0] = 0;
 
-        // Generate codes
+        if (max_code_len == 0) {
+            lookup.clear();
+            return;
+        }
+
         uint16_t next_code[MAX_BITS + 1] = {};
         uint16_t code = 0;
         for (int bits = 1; bits <= MAX_BITS; ++bits) {
@@ -85,40 +98,53 @@ struct HuffmanTree {
             next_code[bits] = code;
         }
 
-        entries.clear();
+        int table_size = 1 << max_code_len;
+        lookup.assign(table_size, 0);
+
         for (int sym = 0; sym < num_syms; ++sym) {
             int len = lengths[sym];
             if (len > 0) {
-                entries.push_back({next_code[len], static_cast<uint8_t>(len), static_cast<uint16_t>(sym)});
+                int c = next_code[len];
                 next_code[len]++;
+
+                int rev_code = static_cast<int>(reverse_bits(static_cast<uint32_t>(c), len));
+                int remaining = max_code_len - len;
+                int num_entries = 1 << remaining;
+
+                for (int suffix = 0; suffix < num_entries; ++suffix) {
+                    int rev_suffix = static_cast<int>(reverse_bits(static_cast<uint32_t>(suffix), remaining));
+                    int idx = rev_code | (rev_suffix << len);
+                    if (idx < table_size) {
+                        lookup[idx] = (static_cast<uint32_t>(len) << 12) |
+                                      static_cast<uint32_t>(sym + 1);
+                    }
+                }
             }
         }
-
-        // Sort by (bits, code) for decoding
-        std::sort(entries.begin(), entries.end(),
-            [](const Entry& a, const Entry& b) {
-                if (a.bits != b.bits) return a.bits < b.bits;
-                return a.code < b.code;
-            });
     }
 
     int decode(BitReader& br) const {
-        uint32_t bits = 0;
-        for (size_t i = 0; i < entries.size(); ++i) {
-            const auto& e = entries[i];
-            while (static_cast<int>(br.bits_in_buf) < e.bits) {
-                if (br.byte_pos >= br.size) throw std::runtime_error("inflate: EOF in decode");
-                br.bit_buf |= static_cast<uint64_t>(br.data[br.byte_pos++]) << br.bits_in_buf;
-                br.bits_in_buf += 8;
-            }
-            bits = static_cast<uint32_t>(br.bit_buf & ((1u << e.bits) - 1));
-            if (bits == e.code) {
-                br.bit_buf >>= e.bits;
-                br.bits_in_buf -= e.bits;
-                return e.symbol;
-            }
+        if (max_code_len == 0)
+            throw std::runtime_error("inflate: empty huffman tree");
+
+        while (br.bits_in_buf < max_code_len) {
+            if (br.byte_pos >= br.size)
+                throw std::runtime_error("inflate: unexpected EOF");
+            br.bit_buf |= static_cast<uint64_t>(br.data[br.byte_pos++]) << br.bits_in_buf;
+            br.bits_in_buf += 8;
         }
-        throw std::runtime_error("inflate: invalid huffman code");
+
+        int code = static_cast<int>(br.bit_buf & ((1u << max_code_len) - 1));
+        uint32_t entry = lookup[static_cast<size_t>(code)];
+        int len = static_cast<int>(entry >> 12);
+        int sym = static_cast<int>(entry & 0xfff) - 1;
+
+        if (len <= 0 || len > max_code_len || sym < 0)
+            throw std::runtime_error("inflate: invalid huffman code");
+
+        br.bit_buf >>= len;
+        br.bits_in_buf -= len;
+        return sym;
     }
 };
 
