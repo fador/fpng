@@ -3,6 +3,7 @@
 #include "png/filter.hpp"
 #include "png/ihdr.hpp"
 #include "compress/deflate/deflater.hpp"
+#include "compress/filter_optimizer.hpp"
 #include "util/crc32.hpp"
 #include "util/endian.hpp"
 #include "util/file.hpp"
@@ -230,16 +231,20 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img) {
             }
         }
     } else {
-        std::vector<uint8_t> prev_scanline(raw_ss, 0);
+        // Optimize filter selection
+        FilterOptions fopts;
+        fopts.level = 1;
+        auto filters = optimize_filters(img, fopts);
 
+        std::vector<uint8_t> prev_scanline(raw_ss, 0);
         for (size_t y = 0; y < height; ++y) {
             const uint8_t* src = img.pixels.data() + y * raw_ss;
             uint8_t row_buf[1 + 65536];
-            filter_scanline(FilterType::None, src, row_buf, bpp, raw_ss,
+            FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
+            filter_scanline(ft, src, row_buf, bpp, raw_ss,
                              y > 0 ? prev_scanline.data() : nullptr);
             filtered.insert(filtered.end(), row_buf, row_buf + 1 + raw_ss);
-
-            if (y > 0) std::memcpy(prev_scanline.data(), src, raw_ss);
+            std::memcpy(prev_scanline.data(), src, raw_ss);
         }
     }
 
@@ -267,7 +272,7 @@ std::vector<uint8_t> PNGWriter::filter_and_compress_frame(const Image& img,
         filter_scanline(FilterType::None, src, row_buf, bpp, raw_ss,
                          y > 0 ? prev_scanline.data() : nullptr);
         filtered.insert(filtered.end(), row_buf, row_buf + 1 + raw_ss);
-        if (y > 0) std::memcpy(prev_scanline.data(), src, raw_ss);
+        std::memcpy(prev_scanline.data(), src, raw_ss);
     }
 
     return zlib_compress(filtered);
