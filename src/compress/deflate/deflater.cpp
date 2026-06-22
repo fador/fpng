@@ -43,6 +43,7 @@ void write_fixed_block(const uint8_t* data, size_t size,
                         std::vector<uint8_t>& out) {
     LZ77Parser parser;
     LZ77Parser::Options parse_opts;
+    parse_opts.use_bt_match = opts.bt_match_finder;
     
     // Iterative refinement
     LZ77Parser::CostModel cm;

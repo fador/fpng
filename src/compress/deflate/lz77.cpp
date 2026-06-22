@@ -1,5 +1,6 @@
 #include "compress/deflate/lz77.hpp"
 #include "compress/deflate/match_finder.hpp"
+#include "compress/deflate/bt_match_finder.hpp"
 
 #include <cstring>
 #include <algorithm>
@@ -121,11 +122,45 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse(
 std::vector<LZ77Parser::Token> LZ77Parser::parse_greedy(
     const uint8_t* data, size_t size, const Options& opts) {
 
-    MatchFinder mf;
-    mf.init(data, size);
-
     std::vector<Token> tokens;
     tokens.reserve(size);
+
+    if (opts.use_bt_match) {
+        BTMatchFinder btmf;
+        btmf.init(data, size);
+        size_t pos = 0;
+        while (pos < size) {
+            auto match = btmf.find_longest(pos, opts.min_match);
+            if (opts.lazy_matching && match.length >= static_cast<uint16_t>(opts.min_match) &&
+                pos + 1 < size) {
+                auto next_match = btmf.find_longest(pos + 1, opts.min_match);
+                if (next_match.length > match.length + 1) {
+                    tokens.push_back({Token::LITERAL, data[pos], 0, 0});
+                    ++pos;
+                    match = next_match;
+                    if (match.length >= static_cast<uint16_t>(opts.min_match)) {
+                        tokens.push_back({Token::MATCH, 0, match.length, match.distance});
+                        pos += match.length;
+                        continue;
+                    }
+                    continue;
+                }
+            }
+            if (match.length >= static_cast<uint16_t>(opts.min_match)) {
+                tokens.push_back({Token::MATCH, 0, match.length, match.distance});
+                pos += match.length;
+            } else {
+                tokens.push_back({Token::LITERAL, data[pos], 0, 0});
+                ++pos;
+            }
+        }
+        tokens.push_back({Token::LITERAL, 0, 0, 0}); // EOB marker
+        return tokens;
+    }
+
+    // Original hash chain path
+    MatchFinder mf;
+    mf.init(data, size);
 
     size_t pos = 0;
     while (pos < size) {
@@ -167,18 +202,57 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_greedy(
 std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
     const uint8_t* data, size_t size, const Options& opts) {
 
-    MatchFinder mf;
-    mf.init(data, size);
-
-    // Forward DP for optimal parsing
-    // cost[i] = minimum bits to encode data[0..i)
     constexpr uint64_t INF = std::numeric_limits<uint64_t>::max();
     std::vector<uint64_t> cost(size + 1, INF);
     std::vector<int> prev_match_len(size + 1, 0);
     std::vector<int> prev_match_dist(size + 1, 0);
     std::vector<bool> is_literal(size + 1, false);
-
     cost[0] = 0;
+
+    if (opts.use_bt_match) {
+        BTMatchFinder btmf;
+        btmf.init(data, size);
+        std::vector<LZMatch> matches;
+        matches.reserve(64);
+
+        for (size_t i = 0; i < size; ++i) {
+            if (cost[i] == INF) continue;
+            if (i + 1 <= size) {
+                uint64_t c = cost[i] + opts.cost_model.literal_cost(data[i]);
+                if (c < cost[i + 1]) { cost[i + 1] = c; is_literal[i + 1] = true; }
+            }
+            btmf.find_all(i, matches, opts.min_match);
+            for (auto& m : matches) {
+                size_t end = i + m.length;
+                if (end > size) end = size;
+                uint64_t c = cost[i] + opts.cost_model.match_cost(m.length, m.distance);
+                if (c < cost[end]) {
+                    cost[end] = c;
+                    prev_match_len[end] = m.length;
+                    prev_match_dist[end] = m.distance;
+                    is_literal[end] = false;
+                }
+            }
+        }
+        // Backtrack (same for both)
+        std::vector<Token> tokens;
+        size_t pos = size;
+        while (pos > 0) {
+            if (is_literal[pos]) { --pos; tokens.push_back({Token::LITERAL, data[pos], 0, 0}); }
+            else {
+                uint16_t len = static_cast<uint16_t>(prev_match_len[pos]);
+                uint16_t dist = static_cast<uint16_t>(prev_match_dist[pos]);
+                pos -= len;
+                tokens.push_back({Token::MATCH, 0, len, dist});
+            }
+        }
+        std::reverse(tokens.begin(), tokens.end());
+        return tokens;
+    }
+
+    // Hash chain path
+    MatchFinder mf;
+    mf.init(data, size);
 
     std::vector<LZMatch> matches;
     matches.reserve(128);

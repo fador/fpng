@@ -84,6 +84,7 @@ public:
         bool lazy_matching = true;
         int  lazy_depth = 2;
         int  min_match = deflate::MIN_MATCH_LEN;
+        bool use_bt_match = false;  // Use binary tree (exhaustive) instead of hash chains
         CostModel cost_model;
     };
 
