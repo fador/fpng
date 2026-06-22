@@ -58,11 +58,33 @@ private:
 // LZ77 parser with multiple strategies
 class LZ77Parser {
 public:
+    struct CostModel {
+        const uint8_t* litlen_lengths = nullptr;  // 288 entries
+        const uint8_t* dist_lengths = nullptr;    // 32 entries
+        
+        uint64_t literal_cost(uint8_t sym) const {
+            if (!litlen_lengths) return 8;
+            return litlen_lengths[sym];
+        }
+        
+        uint64_t match_cost(uint16_t length, uint16_t distance) const {
+            if (!litlen_lengths || !dist_lengths) return 15 + length / 4;
+            int lc = deflate::length_code(length);
+            int dc = deflate::distance_code(distance);
+            uint64_t cost = litlen_lengths[257 + lc];
+            cost += deflate::length_extra_bits(lc);
+            cost += dist_lengths[dc];
+            cost += deflate::distance_extra_bits(dc);
+            return cost;
+        }
+    };
+
     struct Options {
         bool optimal = false;
         bool lazy_matching = true;
         int  lazy_depth = 2;
         int  min_match = deflate::MIN_MATCH_LEN;
+        CostModel cost_model;
     };
 
     struct Token {

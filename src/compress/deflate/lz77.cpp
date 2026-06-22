@@ -182,21 +182,14 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
     cost[0] = 0;
 
     std::vector<LZMatch> matches;
-    matches.reserve(128); // MatchFinder::MAX_CHAIN
-
-    // Estimate costs: literals ~8 bits, matches ~(len/4 + 10) bits
-    // This is approximate - exact costs require Huffman codes
-    auto lit_cost = [](uint8_t) -> uint64_t { return 8; };
-    auto match_cost = [](uint16_t len, uint16_t) -> uint64_t {
-        return 15 + len / 4; // rough estimate
-    };
+    matches.reserve(128);
 
     for (size_t i = 0; i < size; ++i) {
         if (cost[i] == INF) continue;
 
         // Option 1: emit literal
         if (i + 1 <= size) {
-            uint64_t c = cost[i] + lit_cost(data[i]);
+            uint64_t c = cost[i] + opts.cost_model.literal_cost(data[i]);
             if (c < cost[i + 1]) {
                 cost[i + 1] = c;
                 is_literal[i + 1] = true;
@@ -208,7 +201,7 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
         for (auto& m : matches) {
             size_t end = i + m.length;
             if (end > size) end = size;
-            uint64_t c = cost[i] + match_cost(m.length, m.distance);
+            uint64_t c = cost[i] + opts.cost_model.match_cost(m.length, m.distance);
             if (c < cost[end]) {
                 cost[end] = c;
                 prev_match_len[end] = m.length;
