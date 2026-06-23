@@ -13,6 +13,9 @@
 #include <thread>
 #include <iostream>
 #include <cstring>
+#include <future>
+#include <mutex>
+#include <atomic>
 
 namespace fpng {
 
@@ -239,7 +242,14 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                   << " strategies (auto-scaled for " << raw_pixels << "px)\n";
     }
 
-    // Run strategies sequentially
+    // Run strategies in parallel batches
+    int threads = opts.num_threads;
+    if (threads <= 0) threads = std::max(1u, std::thread::hardware_concurrency());
+    threads = std::min(threads, static_cast<int>(filtered.size()));
+
+    // Atomic best size for early pruning across threads
+    std::atomic<size_t> best_atomic{std::numeric_limits<size_t>::max()};
+
     struct TrialResult {
         std::vector<uint8_t> data;
         Strategy strategy;
@@ -249,8 +259,12 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
     std::vector<TrialResult> results;
     results.reserve(filtered.size());
 
-    for (size_t si = 0; si < filtered.size(); ++si) {
-        auto& s = filtered[si];
+    auto run_one_trial = [&](const Strategy& s) -> TrialResult {
+        // Early prune: if another thread found much better, skip expensive strategies
+        size_t current_best = best_atomic.load();
+        if (current_best < std::numeric_limits<size_t>::max() && s.filter_level >= 5) {
+            return {{}, s, std::numeric_limits<size_t>::max()};
+        }
 
         Image work = img;
         if (s.alpha_zero && (img.color_type == 6 || img.color_type == 4))
@@ -282,20 +296,42 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         }
 
         DeflateOptions dopts;
-        dopts.level = CompressionLevel::Fast; // proxy
+        dopts.level = CompressionLevel::Fast;
         dopts.iterations = 1;
-            dopts.optimal_parsing = false;
-            if (s.deflate_level >= CompressionLevel::Ultra)
+        dopts.optimal_parsing = false;
+        if (s.deflate_level >= CompressionLevel::Ultra)
             dopts.chain_depth = 256;
 
         TrialResult tr;
         tr.data = zlib_compress(filtered_data, dopts);
         tr.strategy = s;
         tr.size = tr.data.size();
-        results.push_back(std::move(tr));
 
-        if (opts.verbose)
-            std::cout << "  " << s.name << ": " << tr.size << " bytes\n";
+        // Update atomic best (smaller is better)
+        size_t prev_best = best_atomic.load();
+        while (tr.size < prev_best && !best_atomic.compare_exchange_weak(prev_best, tr.size)) {}
+
+        return tr;
+    };
+
+    // Process strategies in batches to limit concurrency
+    for (size_t batch_start = 0; batch_start < filtered.size(); batch_start += threads) {
+        size_t batch_end = std::min(batch_start + static_cast<size_t>(threads), filtered.size());
+        std::vector<std::future<TrialResult>> batch_futures;
+
+        for (size_t si = batch_start; si < batch_end; ++si) {
+            batch_futures.push_back(std::async(std::launch::async, run_one_trial,
+                                                std::ref(filtered[si])));
+        }
+
+        // Collect batch results
+        for (auto& f : batch_futures) {
+            auto tr = f.get();
+            if (opts.verbose)
+                std::cout << "  " << tr.strategy.name << ": " << tr.size << " bytes\n";
+            if (tr.size < std::numeric_limits<size_t>::max())
+                results.push_back(std::move(tr));
+        }
     }
 
     // Find best
