@@ -60,23 +60,25 @@ private:
 class LZ77Parser {
 public:
     struct CostModel {
-        const uint8_t* litlen_lengths = nullptr;  // 288 entries
-        const uint8_t* dist_lengths = nullptr;    // 32 entries
+        const uint8_t* litlen_lengths = nullptr;   // 288 Huffman code lengths (1-15)
+        const uint8_t* dist_lengths = nullptr;     // 32 Huffman code lengths (1-15)
+        const uint16_t* precomputed_costs = nullptr; // 288+32 entropy costs (scaled)
         
         uint64_t literal_cost(uint8_t sym) const {
+            if (precomputed_costs) return precomputed_costs[sym];
             if (!litlen_lengths) return 8;
             return litlen_lengths[sym];
         }
         
         uint64_t match_cost(uint16_t length, uint16_t distance) const {
-            if (!litlen_lengths || !dist_lengths) return 15 + length / 4;
             int lc = deflate::length_code(length);
             int dc = deflate::distance_code(distance);
-            uint64_t cost = litlen_lengths[257 + lc];
-            cost += deflate::length_extra_bits(lc);
-            cost += dist_lengths[dc];
-            cost += deflate::distance_extra_bits(dc);
-            return cost;
+            uint64_t extra = deflate::length_extra_bits(lc)
+                           + deflate::distance_extra_bits(dc);
+            if (precomputed_costs)
+                return precomputed_costs[257 + lc] + precomputed_costs[288 + dc] + extra;
+            if (!litlen_lengths || !dist_lengths) return 15 + length / 4;
+            return litlen_lengths[257 + lc] + dist_lengths[dc] + extra;
         }
     };
 

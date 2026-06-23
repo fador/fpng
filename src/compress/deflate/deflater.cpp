@@ -6,10 +6,60 @@
 #include <cstring>
 #include <algorithm>
 #include <stdexcept>
+#include <cmath>
+#include <vector>
 
 namespace fpng {
 
 namespace {
+
+// Compute entropy-based costs from symbol frequencies.
+// Returns a 288+32 entry vector of scaled fixed-point costs (scale=1024).
+// cost[sym] = ceil(-log2(freq[sym] / total) * 1024)
+// Unused symbols get a high cost to discourage their use.
+std::vector<uint16_t> compute_entropy_costs(
+    const uint32_t* ll_freq, const uint32_t* d_freq) {
+
+    std::vector<uint16_t> costs(288 + 32, 0);
+
+    // Compute total literal/length frequency
+    uint64_t ll_total = 0;
+    for (int i = 0; i < 288; ++i) ll_total += ll_freq[i];
+    if (ll_total == 0) ll_total = 1;
+
+    // Compute total distance frequency
+    uint64_t d_total = 0;
+    for (int i = 0; i < 32; ++i) d_total += d_freq[i];
+    if (d_total == 0) d_total = 1;
+
+    constexpr int SCALE = 1024;
+    const double log2e = 1.4426950408889634; // 1/ln(2)
+
+    for (int i = 0; i < 288; ++i) {
+        if (ll_freq[i] > 0) {
+            double p = static_cast<double>(ll_freq[i]) / ll_total;
+            double bits = -std::log(p) * log2e;
+            costs[i] = static_cast<uint16_t>(std::ceil(bits * SCALE));
+            if (costs[i] == 0) costs[i] = 1; // minimum 1/1024 bit
+        } else {
+            costs[i] = 65535; // effectively infinite for unused symbols
+        }
+    }
+
+    for (int i = 0; i < 32; ++i) {
+        int idx = 288 + i;
+        if (d_freq[i] > 0) {
+            double p = static_cast<double>(d_freq[i]) / d_total;
+            double bits = -std::log(p) * log2e;
+            costs[idx] = static_cast<uint16_t>(std::ceil(bits * SCALE));
+            if (costs[idx] == 0) costs[idx] = 1;
+        } else {
+            costs[idx] = 65535;
+        }
+    }
+
+    return costs;
+}
 
 // Forward declarations
 void write_stored_block(const uint8_t* data, size_t size,
@@ -61,7 +111,7 @@ void write_fixed_block(const uint8_t* data, size_t size,
         }
         tokens = parser.parse(data, size, parse_opts);
 
-        if (iter + 1 < iters) {
+            if (iter + 1 < iters) {
             // Count frequencies from current tokens
             uint32_t ll_freq[deflate::MAX_LITLEN_SYMS] = {};
             uint32_t d_freq[deflate::MAX_DIST_SYMS] = {};
@@ -76,19 +126,10 @@ void write_fixed_block(const uint8_t* data, size_t size,
             }
             ll_freq[256] = 1;
 
-            // Build cost model (use fixed Huffman lengths)
-            static uint8_t fixed_ll[288], fixed_d[32];
-            static bool inited = false;
-            if (!inited) {
-                for (int i = 0; i <= 143; ++i) fixed_ll[i] = 8;
-                for (int i = 144; i <= 255; ++i) fixed_ll[i] = 9;
-                for (int i = 256; i <= 279; ++i) fixed_ll[i] = 7;
-                for (int i = 280; i <= 287; ++i) fixed_ll[i] = 8;
-                for (int i = 0; i < 32; ++i) fixed_d[i] = 5;
-                inited = true;
-            }
-            cm.litlen_lengths = fixed_ll;
-            cm.dist_lengths = fixed_d;
+            // Use entropy-based costs instead of fixed Huffman lengths
+            static std::vector<uint16_t> entropy_costs_fixed;
+            entropy_costs_fixed = compute_entropy_costs(ll_freq, d_freq);
+            cm.precomputed_costs = entropy_costs_fixed.data();
         }
     }
 
@@ -136,6 +177,8 @@ void write_dynamic_block(const uint8_t* data, size_t size,
     int iters = std::max(1, opts.iterations);
     std::vector<LZ77Parser::Token> tokens;
     std::vector<uint8_t> ll_len, d_len;
+    // Store entropy costs for the CostModel (recomputed each iteration)
+    std::vector<uint16_t> entropy_costs;
 
     for (int iter = 0; iter < iters; ++iter) {
         if (iter == 0) {
@@ -144,13 +187,14 @@ void write_dynamic_block(const uint8_t* data, size_t size,
         } else {
             parse_opts.optimal = true;
             LZ77Parser::CostModel cm;
-            cm.litlen_lengths = ll_len.data();
-            cm.dist_lengths = d_len.data();
+            // Use entropy-based costs (theoretical minimum) for optimal parsing
+            // This is faster and more accurate than building Huffman trees
+            cm.precomputed_costs = entropy_costs.data();
             parse_opts.cost_model = cm;
         }
         tokens = parser.parse(data, size, parse_opts);
 
-        // Count frequencies and build Huffman trees for next iteration
+        // Count frequencies
         uint32_t ll_freq[deflate::MAX_LITLEN_SYMS] = {};
         uint32_t d_freq[deflate::MAX_DIST_SYMS] = {};
         for (size_t i = 0; i + 1 < tokens.size(); ++i) {
@@ -164,6 +208,10 @@ void write_dynamic_block(const uint8_t* data, size_t size,
         }
         ll_freq[deflate::END_OF_BLOCK] = 1;
 
+        // Compute entropy costs for next iteration's CostModel
+        entropy_costs = compute_entropy_costs(ll_freq, d_freq);
+
+        // Build Huffman trees (needed for final encoding, not for CostModel)
         ll_len = HuffmanEncoder::compute_lengths(ll_freq, deflate::MAX_LITLEN_SYMS, 15);
         d_len = HuffmanEncoder::compute_lengths(d_freq, deflate::MAX_DIST_SYMS, 15);
     }
