@@ -44,6 +44,7 @@ void write_fixed_block(const uint8_t* data, size_t size,
     LZ77Parser parser;
     LZ77Parser::Options parse_opts;
     parse_opts.use_bt_match = opts.bt_match_finder;
+    parse_opts.chain_depth = opts.chain_depth;
     
     // Iterative refinement
     LZ77Parser::CostModel cm;
@@ -304,6 +305,14 @@ void write_stored_block(const uint8_t* data, size_t size,
     bw.write_bits(0, 2);
     bw.flush_to_byte();
 
+    // Write the BitWriter's header bytes (BFINAL + BTYPE, padded to byte)
+    if (bw.byte_count() > 0) {
+        out.insert(out.end(),
+                   reinterpret_cast<const uint8_t*>(bw.bytes().data()),
+                   reinterpret_cast<const uint8_t*>(bw.bytes().data()) + bw.byte_count());
+    }
+
+    // Write stored block header
     size_t pos = out.size();
     out.resize(pos + 4);
     uint16_t len = static_cast<uint16_t>(size);
@@ -356,10 +365,15 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
     for (size_t bi = 0; bi < blocks.size(); ++bi) {
         auto& b = blocks[bi];
         bool is_last = (bi == blocks.size() - 1);
-        if (opts.level <= CompressionLevel::Store)
-            write_stored_block(data.data() + b.start_offset,
-                              b.end_offset - b.start_offset,
-                              is_last, out);
+        size_t block_size = b.end_offset - b.start_offset;
+
+        // Short blocks: dynamic Huffman overhead exceeds savings
+        bool use_stored = (opts.level <= CompressionLevel::Store) ||
+                          (block_size < 256 && opts.level < CompressionLevel::Ultra);
+
+        if (use_stored)
+            write_stored_block(data.data() + b.start_offset, block_size,
+                               is_last, out);
         else if (opts.level >= CompressionLevel::Best)
             write_dynamic_block(data.data() + b.start_offset,
                                b.end_offset - b.start_offset,

@@ -34,10 +34,11 @@ public:
 
     size_t data_size() const noexcept { return size_; }
 
+    size_t chain_depth = 128; // Hash chain walk limit (set before init)
+
 private:
     static constexpr size_t HASH_SIZE = 65536;
     static constexpr size_t HASH_SHIFT = 5;
-    static constexpr size_t MAX_CHAIN = 128;
 
     // Hash three bytes
     static uint32_t hash3(const uint8_t* p) noexcept {
@@ -84,7 +85,8 @@ public:
         bool lazy_matching = true;
         int  lazy_depth = 2;
         int  min_match = deflate::MIN_MATCH_LEN;
-        bool use_bt_match = false;  // Use binary tree (exhaustive) instead of hash chains
+        bool use_bt_match = false;
+        int  chain_depth = 128;
         CostModel cost_model;
     };
 

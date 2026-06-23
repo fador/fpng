@@ -87,16 +87,70 @@ public:
     void find_all(size_t pos, std::vector<LZMatch>& matches,
                   int min_len = deflate::MIN_MATCH_LEN) const {
         matches.clear();
-        auto best = find_longest(pos, min_len);
-        if (best.length > 0) {
-            matches.push_back(best);
-            // Also add sub-matches of the best match for optimal parsing
-            if (best.length > static_cast<uint16_t>(min_len + 2)) {
-                matches.push_back({static_cast<uint16_t>(best.length - 1), best.distance});
-                if (best.length > static_cast<uint16_t>(min_len + 4))
-                    matches.push_back({static_cast<uint16_t>(best.length - 2), best.distance});
+        if (pos + static_cast<size_t>(min_len) > size_) return;
+
+        size_t max_match = std::min(size_ - pos, size_t(deflate::MAX_MATCH_LEN));
+        size_t limit = std::min(pos, size_t(deflate::MAX_DIST));
+        const uint8_t* cur = data_ + pos;
+        constexpr int MAX_MATCHES = 16; // cap to bound DP state explosion
+
+        // Collect all distinct matches by walking both BST chains
+        // "smaller" chain: predecessors (lexicographically smaller strings)
+        int s = smaller_[pos];
+        while (s >= 0 && matches.size() < MAX_MATCHES) {
+            size_t candidate = static_cast<size_t>(s);
+            if (pos - candidate > limit) break;
+            if (pos - candidate <= 1) { s = smaller_[candidate]; continue; }
+
+            size_t match_len = simd::match_length(cur + min_len,
+                                                   data_ + candidate + min_len,
+                                                   max_match - min_len) + min_len;
+            if (match_len >= static_cast<size_t>(min_len)) {
+                // Check if we already have a match at this distance (dedup)
+                bool dup = false;
+                for (auto& m : matches) {
+                    if (m.distance == static_cast<uint16_t>(pos - candidate) &&
+                        m.length >= static_cast<uint16_t>(match_len)) {
+                        dup = true; break;
+                    }
+                }
+                if (!dup) {
+                    matches.push_back({static_cast<uint16_t>(match_len),
+                                       static_cast<uint16_t>(pos - candidate)});
+                }
             }
+            s = smaller_[candidate];
         }
+
+        // "larger" chain: successors (lexicographically larger strings)
+        int l = larger_[pos];
+        while (l >= 0 && matches.size() < MAX_MATCHES) {
+            size_t candidate = static_cast<size_t>(l);
+            if (pos - candidate > limit) break;
+            if (pos - candidate <= 1) { l = larger_[candidate]; continue; }
+
+            size_t match_len = simd::match_length(cur + min_len,
+                                                   data_ + candidate + min_len,
+                                                   max_match - min_len) + min_len;
+            if (match_len >= static_cast<size_t>(min_len)) {
+                bool dup = false;
+                for (auto& m : matches) {
+                    if (m.distance == static_cast<uint16_t>(pos - candidate) &&
+                        m.length >= static_cast<uint16_t>(match_len)) {
+                        dup = true; break;
+                    }
+                }
+                if (!dup) {
+                    matches.push_back({static_cast<uint16_t>(match_len),
+                                       static_cast<uint16_t>(pos - candidate)});
+                }
+            }
+            l = larger_[candidate];
+        }
+
+        // Sort by length descending (optimal parser prefers longer matches)
+        std::sort(matches.begin(), matches.end(),
+            [](const LZMatch& a, const LZMatch& b) { return a.length > b.length; });
     }
 
     size_t data_size() const noexcept { return size_; }

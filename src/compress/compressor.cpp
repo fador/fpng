@@ -322,38 +322,57 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
     if (opts.verbose)
         std::cout << "Best proxy: " << best_strat.name << " (" << best->size << " bytes)\n";
 
-    // Two-tier: re-compress the winner with full settings if we used proxy
-    if (use_two_tier) {
-        // Re-do with best strategy at full quality
-        Image work = img;
-        if (best_strat.alpha_zero && (img.color_type == 6 || img.color_type == 4))
-            alpha_optimize(work);
-        if (best_strat.palette_sort)
-            sort_palette(work);
+    // Two-tier: re-compress top 3 proxy winners with full settings
+    // Always do this to fix proxy/actual compression mismatch
+    if (filtered.size() > 0) {
+        auto sorted = results;
+        std::sort(sorted.begin(), sorted.end(),
+            [](const TrialResult& a, const TrialResult& b) { return a.size < b.size; });
 
-        FilterOptions fopts;
-        fopts.level = best_strat.filter_level;
-        fopts.window_size = std::min(3, best_strat.filter_level);
-        auto filters = optimize_filters(work, fopts);
+        size_t best_final = std::numeric_limits<size_t>::max();
+        CompressResult best_result;
 
-        DeflateOptions dopts;
-        dopts.level = best_strat.deflate_level;
-        dopts.iterations = best_strat.deflate_iterations;
-        dopts.optimal_parsing = (best_strat.deflate_iterations > 1);
+        for (size_t ri = 0; ri < std::min(sorted.size(), size_t(3)); ++ri) {
+            auto& strat = sorted[ri].strategy;
 
-        WriteOptions wopts;
-        wopts.filters = filters;
-        wopts.deflate = dopts;
+            Image work = img;
+            if (strat.alpha_zero && (img.color_type == 6 || img.color_type == 4))
+                alpha_optimize(work);
+            if (strat.palette_sort) sort_palette(work);
 
-        PNGWriter writer;
-        auto png_out = writer.write(work, wopts);
+            FilterOptions fopts;
+            fopts.level = strat.filter_level;
+            fopts.window_size = std::min(3, strat.filter_level);
+            auto filters = optimize_filters(work, fopts);
 
-        CompressResult result;
-        result.data = std::move(png_out);
-        result.time_seconds = total.elapsed_seconds();
-        result.original_size = img.pixels.size();
-        result.strategy_name = best_strat.name + "-full";
-        return result;
+            DeflateOptions dopts;
+            dopts.level = strat.deflate_level;
+            dopts.iterations = strat.deflate_iterations;
+            dopts.optimal_parsing = (strat.deflate_iterations > 1);
+            dopts.bt_match_finder = strat.bt_match;
+            if (strat.deflate_level >= CompressionLevel::Ultra || strat.bt_match)
+                dopts.chain_depth = 512;
+
+            WriteOptions wopts;
+            wopts.filters = filters;
+            wopts.deflate = dopts;
+
+            PNGWriter writer;
+            auto png_out = writer.write(work, wopts);
+
+            if (opts.verbose)
+                std::cout << "  Actual " << strat.name << ": " << png_out.size() << " bytes PNG\n";
+
+            if (png_out.size() < best_final || ri == 0) {
+                best_final = png_out.size();
+                best_result.data = std::move(png_out);
+                best_result.strategy_name = strat.name + "-actual";
+            }
+        }
+
+        best_result.time_seconds = total.elapsed_seconds();
+        best_result.original_size = img.pixels.size();
+        return best_result;
     }
 
     // Single-tier: final output

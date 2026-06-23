@@ -42,7 +42,7 @@ LZMatch MatchFinder::find_longest(size_t pos, int min_len) const {
     LZMatch best{0, 0};
     size_t chain_len = 0;
 
-    while (chain_pos >= 0 && chain_len < MAX_CHAIN) {
+    while (chain_pos >= 0 && chain_len < chain_depth) {
         size_t candidate = static_cast<size_t>(chain_pos);
         if (candidate >= pos) { chain_pos = prev_[chain_pos]; ++chain_len; continue; }
         if (pos - candidate > limit) break;
@@ -81,7 +81,7 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
     int32_t chain_pos = heads_[h];
 
     size_t chain_len = 0;
-    while (chain_pos >= 0 && chain_len < MAX_CHAIN) {
+    while (chain_pos >= 0 && chain_len < chain_depth) {
         size_t candidate = static_cast<size_t>(chain_pos);
         if (candidate >= pos) { chain_pos = prev_[chain_pos]; ++chain_len; continue; }
         if (pos - candidate > limit) break;
@@ -160,6 +160,7 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_greedy(
 
     // Original hash chain path
     MatchFinder mf;
+    mf.chain_depth = opts.chain_depth;
     mf.init(data, size);
 
     size_t pos = 0;
@@ -252,6 +253,7 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
 
     // Hash chain path
     MatchFinder mf;
+    mf.chain_depth = opts.chain_depth;
     mf.init(data, size);
 
     std::vector<LZMatch> matches;
