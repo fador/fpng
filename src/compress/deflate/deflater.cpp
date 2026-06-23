@@ -284,9 +284,83 @@ void write_dynamic_block(const uint8_t* data, size_t size,
 
     auto clen_len = HuffmanEncoder::compute_lengths(clen_freq, deflate::MAX_CLEN_SYMS, 7);
     auto clen_code = HuffmanEncoder::lengths_to_codes(clen_len.data(), deflate::MAX_CLEN_SYMS);
-
-    // Determine HCLEN
     int hclen = 19;
+    while (hclen > 4 && clen_len[deflate::CLEN_ORDER[hclen - 1]] == 0)
+        --hclen;
+
+    // Re-encode tree RLE with optimal thresholds using actual CLEN costs.
+    auto optimal_rle = [&](const uint8_t* lengths, int count) {
+            int i = 0;
+            while (i < count) {
+                uint8_t len = lengths[i];
+                if (len == 0) {
+                    int run = 0;
+                    while (i + run < count && lengths[i + run] == 0) ++run;
+
+                    // Compute costs for each encoding choice
+                    int cost_individual = run * clen_len[0];                // individual zeros
+                    int cost_17 = clen_len[17] + 3;                          // repeat 3-10
+                    int cost_18 = clen_len[18] + 7;                          // repeat 11-138
+
+                    // Greedy optimal: pick cheapest for each segment
+                    int processed = 0;
+                    while (processed < run) {
+                        int remaining = run - processed;
+                        if (remaining >= 11 && cost_18 <= cost_individual * std::min(remaining, 138)) {
+                            int n = std::min(remaining, 138);
+                            tree_rle.push_back(18);
+                            tree_rle.push_back(static_cast<uint8_t>(n - 11));
+                            processed += n;
+                        } else if (remaining >= 3 && cost_17 <= cost_individual * std::min(remaining, 10)) {
+                            int n = std::min(remaining, 10);
+                            tree_rle.push_back(17);
+                            tree_rle.push_back(static_cast<uint8_t>(n - 3));
+                            processed += n;
+                        } else {
+                            tree_rle.push_back(0);
+                            processed++;
+                        }
+                    }
+                    i += run;
+                } else {
+                    tree_rle.push_back(len);
+                    ++i;
+                    int run = 0;
+                    while (i + run < count && lengths[i + run] == len) ++run;
+                    if (run >= 3) {
+                        // Code 16: repeat previous length 3-6 times
+                        int cost_16 = clen_len[16] + 2;
+                        int cost_individual = run * clen_len[len];
+                        int n = std::min(run, 6);
+                        if (cost_16 <= cost_individual * n) {
+                            tree_rle.push_back(16);
+                            tree_rle.push_back(static_cast<uint8_t>(n - 3));
+                            i += n;
+                        }
+                    }
+                }
+            }
+        };
+
+    // Rebuild tree_rle with optimal encoding
+    tree_rle.clear();
+    optimal_rle(ll_len.data(), hlit);
+    optimal_rle(d_len.data(), hdist);
+
+    // Recompute CLEN frequencies from optimized RLE
+    std::memset(clen_freq, 0, sizeof(clen_freq));
+    for (size_t i = 0; i < tree_rle.size(); ++i) {
+        uint8_t v = tree_rle[i];
+        if (v < 16) clen_freq[v]++;
+        else { clen_freq[v]++; i++; }
+    }
+
+    // Rebuild CLEN tree with new frequencies
+    clen_len = HuffmanEncoder::compute_lengths(clen_freq, deflate::MAX_CLEN_SYMS, 7);
+    clen_code = HuffmanEncoder::lengths_to_codes(clen_len.data(), deflate::MAX_CLEN_SYMS);
+
+    // Recompute HCLEN
+    hclen = 19;
     while (hclen > 4 && clen_len[deflate::CLEN_ORDER[hclen - 1]] == 0)
         --hclen;
 
