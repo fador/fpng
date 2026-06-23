@@ -62,9 +62,9 @@ std::vector<Strategy> get_strategies(int level) {
     strategies.push_back({3, CompressionLevel::Ultra, 3, true, true, "max-11"});
 
     // GA filter optimization (high-effort)
-    strategies.push_back({5, CompressionLevel::Best, 2, true, "max-12"});
-    strategies.push_back({7, CompressionLevel::Best, 2, true, "max-13"});
-    strategies.push_back({7, CompressionLevel::Ultra, 3, true, "max-14"});
+    strategies.push_back({5, CompressionLevel::Best, 2, true, false, "max-12"});
+    strategies.push_back({7, CompressionLevel::Best, 2, true, false, "max-13"});
+    strategies.push_back({7, CompressionLevel::Ultra, 3, true, false, "max-14"});
 
     // BT match finder variants (exhaustive matching)
     strategies.push_back({2, CompressionLevel::Best, 2, true, false, "max-15"});
@@ -72,10 +72,10 @@ std::vector<Strategy> get_strategies(int level) {
 
     // Zopfli-style: multi-iteration refinement (4-5 passes)
     // Each pass rebuilds Huffman and re-parses with refined costs
-    strategies.push_back({2, CompressionLevel::Ultra, 4, true, "max-17"});
-    strategies.push_back({3, CompressionLevel::Ultra, 4, true, "max-18"});
-    strategies.push_back({2, CompressionLevel::Ultra, 5, true, "max-19"});
-    strategies.push_back({3, CompressionLevel::Ultra, 5, true, "max-20"});
+    strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, "max-17"});
+    strategies.push_back({3, CompressionLevel::Ultra, 4, true, false, "max-18"});
+    strategies.push_back({2, CompressionLevel::Ultra, 5, true, false, "max-19"});
+    strategies.push_back({3, CompressionLevel::Ultra, 5, true, false, "max-20"});
 
     // Combined: BT match finder + high iterations + high filter
     strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, "max-21"});
@@ -184,7 +184,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
     // Auto-scale: reduce effort for large images
     auto strategies = get_strategies(opts.level);
-    bool is_small  = (raw_pixels < 16384);   // < 16KB raw
     bool is_large  = (raw_pixels >= 262144);
     bool is_huge   = (raw_pixels >= 1048576);
 
@@ -195,10 +194,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         // Skip GA strategies for large images (too slow)
         if ((is_large || is_huge) && s.filter_level >= 5) continue;
         if (is_huge && s.filter_level >= 3) continue;
-
-        // Skip expensive strategies for very small images (won't help)
-        if (is_small && s.filter_level >= 5) continue;
-        if (is_small && s.deflate_iterations >= 4) continue;
 
         // Skip BT match finder strategies (correctness issues, WIP)
 

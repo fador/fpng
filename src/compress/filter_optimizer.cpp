@@ -153,7 +153,7 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                 size_t compressed_size = std::numeric_limits<size_t>::max();
             };
 
-            // Fitness: compress image with these filters, return size
+            // Fitness: use byte entropy (fast, correlates well with compressibility)
             auto fitness = [&](const std::vector<FilterType>& filters) -> size_t {
                 std::vector<uint8_t> filtered;
                 std::vector<uint8_t> prev(raw_ss, 0);
@@ -166,9 +166,13 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                     filtered.insert(filtered.end(), row.begin(), row.end());
                     std::memcpy(prev.data(), src, raw_ss);
                 }
-                DeflateOptions dopts;
-                dopts.level = CompressionLevel::Fast; // fast but uses actual LZ77+Huffman
-                return deflate_compress(filtered, dopts).size();
+                // Use byte entropy * 100 as integer proxy (lower = better)
+                double ent = byte_entropy(filtered.data(), filtered.size());
+                // Also add a small penalty for filter variety (encourages runs)
+                int switches = 0;
+                for (size_t y = 1; y < filters.size(); ++y)
+                    if (filters[y] != filters[y-1]) ++switches;
+                return static_cast<size_t>(ent * 100.0) + switches * 2;
             };
 
             // Initialize population
@@ -288,8 +292,8 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
 
             result = pop[0].filters;
 
-            // Re-evaluate top 3 GA winners with actual dynamic Huffman compression
-            // (GA uses fast deflate as proxy, which may not correlate perfectly)
+            // Re-evaluate top 3 GA winners with byte entropy (faster than deflate)
+            // Entropy correlates with compressibility and is much faster
             {
                 auto fitness_real = [&](const std::vector<FilterType>& filters) -> size_t {
                     std::vector<uint8_t> filtered;
@@ -303,9 +307,8 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                         filtered.insert(filtered.end(), row.begin(), row.end());
                         std::memcpy(prev.data(), src, raw_ss);
                     }
-                    DeflateOptions dopts;
-                    dopts.level = CompressionLevel::Default; // dynamic Huffman
-                    return deflate_compress(filtered, dopts).size();
+                    double ent = byte_entropy(filtered.data(), filtered.size());
+                    return static_cast<size_t>(ent * 100.0);
                 };
 
                 size_t best_real = fitness_real(result);
@@ -338,9 +341,8 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                     filtered.insert(filtered.end(), row.begin(), row.end());
                     std::memcpy(prev.data(), src, raw_ss);
                 }
-                DeflateOptions dopts;
-                dopts.level = CompressionLevel::Fast;
-                return deflate_compress(filtered, dopts).size();
+                double ent = byte_entropy(filtered.data(), filtered.size());
+                return static_cast<size_t>(ent * 100.0);
             };
 
             // Initial solutions to try
