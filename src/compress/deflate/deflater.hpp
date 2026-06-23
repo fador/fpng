@@ -24,7 +24,7 @@ struct DeflateOptions {
     int iterations = 1;
     bool optimal_parsing = false;
     bool adaptive_blocks = true;
-    size_t max_block_size = 65536;
+    size_t max_block_size = 0;   // 0=auto (scales with data size)
     int  chain_depth = 0;        // 0=auto (selected by compression level)
     bool verbose = false;
 };

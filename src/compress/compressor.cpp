@@ -317,6 +317,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         dopts.optimal_parsing = false;
         dopts.adaptive_blocks = !is_huge; // adaptive for all but huge images
         dopts.chain_depth = 0; // auto-select based on level
+        dopts.max_block_size = 65536; // large blocks for proxy (no tree overhead with Fixed)
 
         TrialResult tr;
         tr.data = zlib_compress(filtered_data, dopts);

@@ -470,11 +470,18 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
         return out;
     }
 
-    // Use fixed Huffman blocks for compression
+    // Use fixed Huffman blocks for compression.
+    // Auto-scale: for large images (>=128K bytes filtered), use 8192-byte
+    // blocks to specialize Huffman trees per data region. For smaller
+    // images, use a single 65536-byte block to minimize tree overhead.
+    size_t eff_block_size = opts.max_block_size;
+    if (eff_block_size == 0) {
+        eff_block_size = (data.size() >= 131072) ? 8192 : 65536;
+    }
     auto blocks = opts.adaptive_blocks
         ? BlockSplitter::split_greedy_adaptive(data.data(), data.size(),
-                                                4096, opts.max_block_size)
-        : BlockSplitter::split(data.data(), data.size(), opts.max_block_size);
+                                                4096, eff_block_size)
+        : BlockSplitter::split(data.data(), data.size(), eff_block_size);
 
     if (blocks.empty())
         blocks.push_back({0, data.size()});

@@ -27,7 +27,7 @@ Results below use `fpng -o9 -j4` (maximum quality, 4 threads) compared with `opt
 
 | Image | Original | fpng | optipng | pngcrush |
 |-------|----------|------|---------|----------|
-| `large_photo_256x256.png` (256×256 RGBA) | 94,669 | 30,487 (67.8%) | **12,598** (86.7%) | 12,598 (86.7%) |
+| `large_photo_256x256.png` (256×256 RGBA) | 94,669 | 22,386 (76.4%) | **12,598** (86.7%) | 12,598 (86.7%) |
 | `kodim01.png` (768×512 RGB) | 736,501 | 736,501 (0.0%) | 736,501 (0.0%) | 736,501 (0.0%) |
 | `kodim02.png` (768×512 RGB) | 617,995 | 617,995 (0.0%) | 617,995 (0.0%) | 617,995 (0.0%) |
 
@@ -99,6 +99,7 @@ fpng's re-compression matches or improves on the original encoder in most cases.
 - **Stored-block entropy check**: For blocks 256-512 bytes, byte entropy is computed to decide stored vs dynamic. If entropy < 3 bits/byte (highly repetitive data), dynamic Huffman is used despite tree overhead. Replaces the fixed 256-byte threshold.
 - **4-byte hash + deeper chains**: Upgraded `hash3()` → `hash4()` (4 bytes → 16-bit hash) with shifted sub-slot using bytes 1-3. Chain depths scaled to 128/1024/4096/8192 for Fast/Default/Best/Ultra. 16 sub-slots. Combined, these give ~16× better hash collision discrimination than the original single-level hash3.
 - **3-iteration DP refinement for large images**: Bumped `max_iterations` from 2 to 3 for large images to give the iterative DP↔entropy feedback loop one more round to converge.
+- **Auto-scaled block size**: Blocks auto-size: 8K for filtered data ≥128K bytes (specialized Huffman trees per region), 64K otherwise (minimal tree overhead). Proxy runs always use 64K (no tree overhead for Fixed Huffman). Reduces deflate output by 24% on `large_photo_256x256` (30,487→22,386).
 
 ## Running Your Own Benchmarks
 

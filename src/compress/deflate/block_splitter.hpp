@@ -21,20 +21,20 @@ public:
     // Returns list of (start, end) offsets
     static std::vector<BlockSplit> split(
         const uint8_t* data, size_t size,
-        size_t max_block_size = 65536);
+        size_t max_block_size = 8192);
 
-    // Adaptive block splitting based on frequency changes
+    // Adaptive block splitting based on frequency changes (DP-based, slower)
     static std::vector<BlockSplit> split_adaptive(
         const uint8_t* data, size_t size,
-        size_t min_block = 1024,
-        size_t max_block = 65536);
+        size_t min_block = 2048,
+        size_t max_block = 8192);
 
     // Greedy entropy-based adaptive splitting (fast O(n))
     static std::vector<BlockSplit> split_greedy_adaptive(
         const uint8_t* data, size_t size,
-        size_t min_block = 4096,
-        size_t max_block = 65536,
-        size_t max_blocks = 8);
+        size_t min_block = 2048,
+        size_t max_block = 8192,
+        size_t max_blocks = 16);
 };
 
 } // namespace fpng
