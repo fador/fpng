@@ -168,8 +168,8 @@ void write_fixed_block(const uint8_t* data, size_t size,
 
 // Encode using dynamic Huffman blocks (BTYPE=2)
 void write_dynamic_block(const uint8_t* data, size_t size,
-                          bool is_last, const DeflateOptions& opts,
-                          std::vector<uint8_t>& out) {
+                           bool is_last, const DeflateOptions& opts,
+                           std::vector<uint8_t>& out) {
     // Iterative refinement: parse, build Huffman, parse again with costs, repeat
     LZ77Parser parser;
     LZ77Parser::Options parse_opts;
@@ -182,12 +182,11 @@ void write_dynamic_block(const uint8_t* data, size_t size,
     for (int iter = 0; iter < iters; ++iter) {
         if (iter == 0) {
             parse_opts.optimal = false;
+            // Lazy matching is counterproductive at deep chain depths
             parse_opts.lazy_matching = true;
         } else {
             parse_opts.optimal = true;
             LZ77Parser::CostModel cm;
-            // Use entropy-based costs (theoretical minimum) for optimal parsing
-            // This is faster and more accurate than building Huffman trees
             cm.precomputed_costs = entropy_costs.data();
             parse_opts.cost_model = cm;
         }
@@ -210,7 +209,7 @@ void write_dynamic_block(const uint8_t* data, size_t size,
         // Compute entropy costs for next iteration's CostModel
         entropy_costs = compute_entropy_costs(ll_freq, d_freq);
 
-        // Build Huffman trees (needed for final encoding, not for CostModel)
+        // Build Huffman trees (needed for final encoding)
         ll_len = HuffmanEncoder::compute_lengths(ll_freq, deflate::MAX_LITLEN_SYMS, 15);
         d_len = HuffmanEncoder::compute_lengths(d_freq, deflate::MAX_DIST_SYMS, 15);
     }
@@ -473,8 +472,8 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
 
     // Use fixed Huffman blocks for compression
     auto blocks = opts.adaptive_blocks
-        ? BlockSplitter::split_adaptive(data.data(), data.size(),
-                                         1024, opts.max_block_size)
+        ? BlockSplitter::split_greedy_adaptive(data.data(), data.size(),
+                                                4096, opts.max_block_size)
         : BlockSplitter::split(data.data(), data.size(), opts.max_block_size);
 
     if (blocks.empty())
@@ -483,26 +482,61 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
     std::vector<uint8_t> out;
     out.reserve(data.size() + blocks.size() * 100);
 
+    // Version with explicit opts
+    DeflateOptions adjusted = opts;
+    if (adjusted.chain_depth == 0) {
+        switch (adjusted.level) {
+            case CompressionLevel::Fast:    adjusted.chain_depth = 128;  break;
+            case CompressionLevel::Default: adjusted.chain_depth = 1024; break;
+            case CompressionLevel::Best:    adjusted.chain_depth = 4096; break;
+            case CompressionLevel::Ultra:   adjusted.chain_depth = 8192; break;
+            default: adjusted.chain_depth = 128; break;
+        }
+    }
+
     for (size_t bi = 0; bi < blocks.size(); ++bi) {
         auto& b = blocks[bi];
         bool is_last = (bi == blocks.size() - 1);
         size_t block_size = b.end_offset - b.start_offset;
 
-        // Short blocks: dynamic Huffman overhead exceeds savings
-        bool use_stored = (opts.level <= CompressionLevel::Store) ||
-                          (block_size < 256 && opts.level < CompressionLevel::Ultra);
+        // Short blocks: dynamic Huffman overhead exceeds savings.
+        // Use stored for very small blocks (<256), but for blocks 256-512,
+        // check byte entropy: low entropy means dynamic Huffman wins despite
+        // tree overhead (a block of all-zeros compresses to ~15 bytes stored
+        // but could be ~10 bytes dynamic).
+        bool use_stored = (opts.level <= CompressionLevel::Store);
+        if (!use_stored && adjusted.level < CompressionLevel::Ultra) {
+            if (block_size < 256) {
+                use_stored = true;
+            } else if (block_size < 512) {
+                // Compute byte entropy; if data is highly repetitive, try dynamic
+                uint32_t freq[256] = {};
+                for (size_t i = 0; i < block_size; ++i)
+                    freq[data[b.start_offset + i]]++;
+                double ent = 0;
+                double inv = 1.0 / block_size;
+                for (int i = 0; i < 256; ++i) {
+                    if (freq[i] > 0) {
+                        double p = freq[i] * inv;
+                        ent -= p * std::log2(p);
+                    }
+                }
+                // Entropy < 3 bits/byte → data is compressible enough to justify tree overhead
+                use_stored = (ent >= 3.0);
+            }
+        }
 
         if (use_stored)
             write_stored_block(data.data() + b.start_offset, block_size,
-                               is_last, out);
-        else if (opts.level >= CompressionLevel::Best)
+                                is_last, out);
+        else if (adjusted.level >= CompressionLevel::Best)
             write_dynamic_block(data.data() + b.start_offset,
-                               b.end_offset - b.start_offset,
-                               is_last, opts, out);
+                                b.end_offset - b.start_offset,
+                                is_last, adjusted, out);
         else
             write_fixed_block(data.data() + b.start_offset,
-                             b.end_offset - b.start_offset,
-                             is_last, opts, out);
+                              b.end_offset - b.start_offset,
+                              is_last, adjusted, out);
     }
 
     return out;

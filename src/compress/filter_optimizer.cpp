@@ -146,6 +146,30 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                 POP = std::min(POP, 30);
                 GENS = std::min(GENS, 50);
             }
+
+            // Guard: if population too small, fall back to MinSum heuristic
+            if (POP < 5 || GENS < 1) {
+                std::vector<FilterType> result(height, FilterType::None);
+                std::vector<uint8_t> prev(raw_ss, 0);
+                for (size_t y = 0; y < height; ++y) {
+                    const uint8_t* src = img.pixels.data() + y * raw_ss;
+                    std::vector<uint8_t> filtered(raw_ss + 1);
+                    FilterType best = FilterType::None;
+                    uint64_t best_cost = std::numeric_limits<uint64_t>::max();
+                    for (int ft = 0; ft <= 4; ++ft) {
+                        auto type = static_cast<FilterType>(ft);
+                        filter_scanline(type, src, filtered.data(), bpp, raw_ss,
+                                         y > 0 ? prev.data() : nullptr);
+                        uint64_t cost = 0;
+                        for (size_t b = 1; b <= raw_ss; ++b) cost += filtered[b];
+                        if (cost < best_cost) { best_cost = cost; best = type; }
+                    }
+                    result[y] = best;
+                    std::memcpy(prev.data(), src, raw_ss);
+                }
+                return result;
+            }
+
             const int ELITE = std::max(1, POP / 10);
 
             struct Individual {
@@ -153,26 +177,29 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                 size_t compressed_size = std::numeric_limits<size_t>::max();
             };
 
-            // Fitness: use byte entropy (fast, correlates well with compressibility)
+            // Fitness: use MinSum (sum of absolute filtered byte values).
+            // This correlates strongly with LZ77+Huffman compressibility because
+            // smaller filtered values = more repeated small bytes = better matches.
+            // Byte entropy alone is a poor proxy — it can prefer filter None
+            // for gradient images even when Paeth-produced residuals compress
+            // much better with LZ77.
             auto fitness = [&](const std::vector<FilterType>& filters) -> size_t {
-                std::vector<uint8_t> filtered;
                 std::vector<uint8_t> prev(raw_ss, 0);
+                uint64_t min_sum = 0;
                 for (size_t y = 0; y < height; ++y) {
                     const uint8_t* src = img.pixels.data() + y * raw_ss;
                     std::vector<uint8_t> row(raw_ss + 1);
                     FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
                     filter_scanline(ft, src, row.data(), bpp, raw_ss,
                                      y > 0 ? prev.data() : nullptr);
-                    filtered.insert(filtered.end(), row.begin(), row.end());
+                    for (size_t b = 1; b <= raw_ss; ++b)
+                        min_sum += row[b];
                     std::memcpy(prev.data(), src, raw_ss);
                 }
-                // Use byte entropy * 100 as integer proxy (lower = better)
-                double ent = byte_entropy(filtered.data(), filtered.size());
-                // Also add a small penalty for filter variety (encourages runs)
                 int switches = 0;
                 for (size_t y = 1; y < filters.size(); ++y)
                     if (filters[y] != filters[y-1]) ++switches;
-                return static_cast<size_t>(ent * 100.0) + switches * 2;
+                return static_cast<size_t>(min_sum) + static_cast<size_t>(switches) * 1000;
             };
 
             // Initialize population
@@ -253,7 +280,7 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                     if (gen > GENS / 2) mut_rate = 0.02; // reduce later
 
                     for (size_t r = 0; r < height; ++r) {
-                        if ((rng() % 1000) < static_cast<int>(mut_rate * 1000)) {
+                        if (rng() % 1000 < static_cast<unsigned long>(mut_rate * 1000)) {
                             // Local burst: flip this and nearby rows
                             int burst = (rng() % 3) + 1;
                             for (int b = 0; b < burst; ++b) {
@@ -292,35 +319,6 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
 
             result = pop[0].filters;
 
-            // Re-evaluate top 3 GA winners with byte entropy (faster than deflate)
-            // Entropy correlates with compressibility and is much faster
-            {
-                auto fitness_real = [&](const std::vector<FilterType>& filters) -> size_t {
-                    std::vector<uint8_t> filtered;
-                    std::vector<uint8_t> prev(raw_ss, 0);
-                    for (size_t y = 0; y < height; ++y) {
-                        const uint8_t* src = img.pixels.data() + y * raw_ss;
-                        std::vector<uint8_t> row(raw_ss + 1);
-                        FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
-                        filter_scanline(ft, src, row.data(), bpp, raw_ss,
-                                         y > 0 ? prev.data() : nullptr);
-                        filtered.insert(filtered.end(), row.begin(), row.end());
-                        std::memcpy(prev.data(), src, raw_ss);
-                    }
-                    double ent = byte_entropy(filtered.data(), filtered.size());
-                    return static_cast<size_t>(ent * 100.0);
-                };
-
-                size_t best_real = fitness_real(result);
-                for (int i = 1; i < std::min(POP, 5); ++i) {
-                    size_t sz = fitness_real(pop[i].filters);
-                    if (sz < best_real) {
-                        best_real = sz;
-                        result = pop[i].filters;
-                    }
-                }
-            }
-
         } else {
             // === Stochastic hill-climbing with restarts (levels 5-6) ===
             const int MAX_STEPS = static_cast<int>(height) * 3;
@@ -330,19 +328,19 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
             size_t best_size = std::numeric_limits<size_t>::max();
 
             auto fitness_hc = [&](const std::vector<FilterType>& filters) -> size_t {
-                std::vector<uint8_t> filtered;
                 std::vector<uint8_t> prev(raw_ss, 0);
+                uint64_t min_sum = 0;
                 for (size_t y = 0; y < height; ++y) {
                     const uint8_t* src = img.pixels.data() + y * raw_ss;
                     std::vector<uint8_t> row(raw_ss + 1);
                     FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
                     filter_scanline(ft, src, row.data(), bpp, raw_ss,
                                      y > 0 ? prev.data() : nullptr);
-                    filtered.insert(filtered.end(), row.begin(), row.end());
+                    for (size_t b = 1; b <= raw_ss; ++b)
+                        min_sum += row[b];
                     std::memcpy(prev.data(), src, raw_ss);
                 }
-                double ent = byte_entropy(filtered.data(), filtered.size());
-                return static_cast<size_t>(ent * 100.0);
+                return static_cast<size_t>(min_sum);
             };
 
             // Initial solutions to try

@@ -33,24 +33,44 @@ public:
     size_t data_size() const noexcept { return size_; }
 
     size_t chain_depth = 128; // Hash chain walk limit (set before init)
+    int nice_len = 32;         // Early exit when match >= this length
 
 private:
     static constexpr size_t HASH_SIZE = 65536;
-    static constexpr size_t HASH_SHIFT = 5;
+    static constexpr size_t SUB_SLOTS = 16;
+    static constexpr size_t TOTAL_HEADS = HASH_SIZE * SUB_SLOTS;
 
-    // Hash three bytes
+    // Hash three bytes (for min-match-length quick check)
     static uint32_t hash3(const uint8_t* p) noexcept {
         return ((static_cast<uint32_t>(p[0]) << 10) ^
                 (static_cast<uint32_t>(p[1]) << 5) ^
                  static_cast<uint32_t>(p[2])) & (HASH_SIZE - 1);
     }
 
+    // Hash four bytes (better discrimination for common prefixes)
+    static uint32_t hash4(const uint8_t* p) noexcept {
+        return ((static_cast<uint32_t>(p[0]) << 10) ^
+                (static_cast<uint32_t>(p[1]) << 5) ^
+                 static_cast<uint32_t>(p[2]) ^
+                (static_cast<uint32_t>(p[3]) << 15)) & (HASH_SIZE - 1);
+    }
+
+    // Secondary hash for sub-slot within a hash bucket (uses bytes 1-3)
+    static int subslot_offset(const uint8_t* p) noexcept {
+        return ((p[1] * 7 + p[2] * 3 + p[0]) >> 5) & (SUB_SLOTS - 1);
+    }
+
+    // Get flat index into heads_ array
+    static size_t head_index(uint32_t hash, int subslot) noexcept {
+        return static_cast<size_t>(hash) * SUB_SLOTS + static_cast<size_t>(subslot);
+    }
+
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
 
-    // For each hash value, the head of its chain
+    // For each (hash, subslot) pair, the head of its chain
     mutable std::vector<int32_t> heads_;
-    // For each position, the next position with the same hash
+    // For each position, the next position with the same (hash, subslot)
     mutable std::vector<int32_t> prev_;
 };
 
@@ -83,9 +103,10 @@ public:
     struct Options {
         bool optimal = false;
         bool lazy_matching = true;
-        int  lazy_depth = 2;
+        int  lazy_depth = 3;
         int  min_match = deflate::MIN_MATCH_LEN;
         int  chain_depth = 128;
+        int  nice_len = 32;
         CostModel cost_model;
     };
 

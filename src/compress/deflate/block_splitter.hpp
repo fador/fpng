@@ -28,6 +28,13 @@ public:
         const uint8_t* data, size_t size,
         size_t min_block = 1024,
         size_t max_block = 65536);
+
+    // Greedy entropy-based adaptive splitting (fast O(n))
+    static std::vector<BlockSplit> split_greedy_adaptive(
+        const uint8_t* data, size_t size,
+        size_t min_block = 4096,
+        size_t max_block = 65536,
+        size_t max_blocks = 8);
 };
 
 } // namespace fpng
