@@ -1,5 +1,6 @@
 #pragma once
 
+#include "compress/deflate/match_finder.hpp" // LZMatch, simd
 #include "compress/deflate/constants.hpp"
 
 #include <cstdint>
@@ -10,10 +11,7 @@
 
 namespace fpng {
 
-struct LZMatch {
-    uint16_t length = 0;
-    uint16_t distance = 0;
-};
+struct LZMatch; // defined in match_finder.hpp
 
 // Hash chain match finder for LZ77
 class MatchFinder {
@@ -87,7 +85,6 @@ public:
         bool lazy_matching = true;
         int  lazy_depth = 2;
         int  min_match = deflate::MIN_MATCH_LEN;
-        bool use_bt_match = false;
         int  chain_depth = 128;
         CostModel cost_model;
     };

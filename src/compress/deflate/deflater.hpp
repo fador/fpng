@@ -25,7 +25,6 @@ struct DeflateOptions {
     bool optimal_parsing = false;
     bool adaptive_blocks = true;
     size_t max_block_size = 65536;
-    bool bt_match_finder = false;
     int  chain_depth = 128;       // Hash chain walk limit (256-512 for ultra)
     bool verbose = false;
 };

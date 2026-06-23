@@ -38,7 +38,6 @@ struct Strategy {
     int deflate_iterations;
     bool alpha_zero;
     bool palette_sort;
-    bool bt_match = false;      // Use binary tree match finder (slower, better)
     std::string name;
 };
 

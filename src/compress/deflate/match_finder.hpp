@@ -5,7 +5,7 @@
 #include <cstring>
 #include <algorithm>
 
-// Platform-specific SIMD includes must be at file scope
+// SIMD includes must be at file scope
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -17,6 +17,11 @@
 #endif
 
 namespace fpng {
+
+struct LZMatch {
+    uint16_t length = 0;
+    uint16_t distance = 0;
+};
 namespace simd {
 
 inline size_t match_length(const uint8_t* a, const uint8_t* b, size_t max_len) noexcept {

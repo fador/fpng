@@ -21,65 +21,65 @@ std::vector<Strategy> get_strategies(int level) {
 
     if (level <= 0) {
         // Fast: just one strategy
-        strategies.push_back({0, CompressionLevel::Fast, 1, true, false, false, "fast"});
+        strategies.push_back({0, CompressionLevel::Fast, 1, true, false, "fast"});
         return strategies;
     }
 
     if (level <= 3) {
         // Balanced: a few strategies
-        strategies.push_back({2, CompressionLevel::Default, 1, true, false, false, "balanced-a"});
-        strategies.push_back({2, CompressionLevel::Best, 1, true, false, false, "balanced-b"});
+        strategies.push_back({2, CompressionLevel::Default, 1, true, false, "balanced-a"});
+        strategies.push_back({2, CompressionLevel::Best, 1, true, false, "balanced-b"});
         return strategies;
     }
 
     if (level <= 6) {
         // Good: more strategies
-        strategies.push_back({2, CompressionLevel::Default, 1, true, false, false, "good-a"});
-        strategies.push_back({2, CompressionLevel::Best, 1, true, false, false, "good-b"});
-        strategies.push_back({2, CompressionLevel::Best, 2, true, false, false, "good-c"});
-        strategies.push_back({3, CompressionLevel::Best, 2, true, false, false, "good-d"});
+        strategies.push_back({2, CompressionLevel::Default, 1, true, false, "good-a"});
+        strategies.push_back({2, CompressionLevel::Best, 1, true, false, "good-b"});
+        strategies.push_back({2, CompressionLevel::Best, 2, true, false, "good-c"});
+        strategies.push_back({3, CompressionLevel::Best, 2, true, false, "good-d"});
         return strategies;
     }
 
     // Maximum: try many strategies including GA filter optimization
-    strategies.push_back({2, CompressionLevel::Default, 1, true, false, false, "max-01"});
-    strategies.push_back({2, CompressionLevel::Best, 1, true, false, false, "max-02"});
-    strategies.push_back({2, CompressionLevel::Best, 2, true, false, false, "max-03"});
-    strategies.push_back({2, CompressionLevel::Ultra, 2, true, false, false, "max-04"});
-    strategies.push_back({3, CompressionLevel::Best, 1, true, false, false, "max-05"});
-    strategies.push_back({3, CompressionLevel::Best, 2, true, false, false, "max-06"});
-    strategies.push_back({3, CompressionLevel::Ultra, 3, true, false, false, "max-07"});
+    strategies.push_back({2, CompressionLevel::Default, 1, true, "max-01"});
+    strategies.push_back({2, CompressionLevel::Best, 1, true, "max-02"});
+    strategies.push_back({2, CompressionLevel::Best, 2, true, "max-03"});
+    strategies.push_back({2, CompressionLevel::Ultra, 2, true, "max-04"});
+    strategies.push_back({3, CompressionLevel::Best, 1, true, "max-05"});
+    strategies.push_back({3, CompressionLevel::Best, 2, true, "max-06"});
+    strategies.push_back({3, CompressionLevel::Ultra, 3, true, "max-07"});
 
     // Alpha-zero off variants
-    strategies.push_back({2, CompressionLevel::Best, 2, false, false, false, "max-08"});
-    strategies.push_back({3, CompressionLevel::Ultra, 3, false, false, false, "max-09"});
+    strategies.push_back({2, CompressionLevel::Best, 2, false, false, "max-08"});
+    strategies.push_back({3, CompressionLevel::Ultra, 3, false, false, "max-09"});
 
     // Palette-sort variants
-    strategies.push_back({2, CompressionLevel::Best, 2, true, true, false, "max-10"});
-    strategies.push_back({3, CompressionLevel::Ultra, 3, true, true, false, "max-11"});
+    strategies.push_back({2, CompressionLevel::Best, 2, true, true, "max-10"});
+    strategies.push_back({3, CompressionLevel::Ultra, 3, true, true, "max-11"});
 
     // GA filter optimization (high-effort)
-    strategies.push_back({5, CompressionLevel::Best, 2, true, false, false, "max-12"});
-    strategies.push_back({7, CompressionLevel::Best, 2, true, false, false, "max-13"});
-    strategies.push_back({7, CompressionLevel::Ultra, 3, true, false, false, "max-14"});
+    strategies.push_back({5, CompressionLevel::Best, 2, true, "max-12"});
+    strategies.push_back({7, CompressionLevel::Best, 2, true, "max-13"});
+    strategies.push_back({7, CompressionLevel::Ultra, 3, true, "max-14"});
 
     // BT match finder variants (exhaustive matching)
-    strategies.push_back({2, CompressionLevel::Best, 2, true, false, true,  "max-15"});
-    strategies.push_back({3, CompressionLevel::Ultra, 3, true, false, true, "max-16"});
+    strategies.push_back({2, CompressionLevel::Best, 2, true, false, "max-15"});
+    strategies.push_back({3, CompressionLevel::Ultra, 3, true, false, "max-16"});
 
     // Zopfli-style: multi-iteration refinement (4-5 passes)
     // Each pass rebuilds Huffman and re-parses with refined costs
-    strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, false, "max-17"});
-    strategies.push_back({3, CompressionLevel::Ultra, 4, true, false, false, "max-18"});
-    strategies.push_back({2, CompressionLevel::Ultra, 5, true, false, false, "max-19"});
-    strategies.push_back({3, CompressionLevel::Ultra, 5, true, false, false, "max-20"});
+    strategies.push_back({2, CompressionLevel::Ultra, 4, true, "max-17"});
+    strategies.push_back({3, CompressionLevel::Ultra, 4, true, "max-18"});
+    strategies.push_back({2, CompressionLevel::Ultra, 5, true, "max-19"});
+    strategies.push_back({3, CompressionLevel::Ultra, 5, true, "max-20"});
 
     // Combined: BT match finder + high iterations + high filter
-    strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, true,  "max-21"});
-    strategies.push_back({3, CompressionLevel::Ultra, 5, true, false, true,  "max-22"});
+    strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, "max-21"});
+    strategies.push_back({3, CompressionLevel::Ultra, 5, true, false, "max-22"});
 
     // Pure quality: GA filter + BT match + max iterations
-    strategies.push_back({7, CompressionLevel::Ultra, 5, true, false, true,  "max-23"});
+    strategies.push_back({7, CompressionLevel::Ultra, 5, true, false, "max-23"});
 
     return strategies;
 }
@@ -125,7 +125,6 @@ std::vector<uint8_t> run_strategy(const Image& img, const Strategy& s) {
     dopts.level = s.deflate_level;
     dopts.iterations = s.deflate_iterations;
     dopts.optimal_parsing = (s.deflate_iterations > 1);
-    dopts.bt_match_finder = s.bt_match;
 
     return zlib_compress(filtered, dopts);
 }
@@ -199,7 +198,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         if (is_small && s.deflate_iterations >= 4) continue;
 
         // Skip BT match finder strategies (correctness issues, WIP)
-        if (s.bt_match) continue;
 
         // Skip palette-sort for non-indexed photo images
         if (s.palette_sort && content.is_photographic && img.color_type != 3)
@@ -220,7 +218,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
     // Ensure we have at least 2 strategies
     if (filtered.size() < 2) {
-        filtered.push_back({2, CompressionLevel::Best, 1, true, false, false, "fallback"});
+        filtered.push_back({2, CompressionLevel::Best, 1, true, false, "fallback"});
     }
 
     // Sort: try cheapest strategies first (so we can early-terminate)
@@ -286,9 +284,8 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         DeflateOptions dopts;
         dopts.level = CompressionLevel::Fast; // proxy
         dopts.iterations = 1;
-        dopts.optimal_parsing = false;
-        dopts.bt_match_finder = s.bt_match;
-        if (s.bt_match || s.deflate_level >= CompressionLevel::Ultra)
+            dopts.optimal_parsing = false;
+            if (s.deflate_level >= CompressionLevel::Ultra)
             dopts.chain_depth = 256;
 
         TrialResult tr;
@@ -336,8 +333,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
             dopts.level = strat.deflate_level;
             dopts.iterations = strat.deflate_iterations;
             dopts.optimal_parsing = (strat.deflate_iterations > 1);
-            dopts.bt_match_finder = strat.bt_match;
-            if (strat.deflate_level >= CompressionLevel::Ultra || strat.bt_match)
                 dopts.chain_depth = 512;
 
             WriteOptions wopts;
@@ -368,7 +363,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
     wopts.deflate.level = best_strat.deflate_level;
     wopts.deflate.iterations = best_strat.deflate_iterations;
     wopts.deflate.optimal_parsing = (best_strat.deflate_iterations > 1);
-    wopts.deflate.bt_match_finder = best_strat.bt_match;
 
     // Need to re-filter since the writer auto-computes
     Image work2 = img;
