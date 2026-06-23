@@ -18,7 +18,6 @@ size_t estimate_block_cost(const uint8_t* data, size_t size) {
 
     // Count literal frequencies
     uint32_t lit_freq[256] = {};
-    size_t run_lengths[256] = {}; // for simple RLE detection
     for (size_t i = 0; i < size; ++i)
         lit_freq[data[i]]++;
 
@@ -51,7 +50,7 @@ size_t estimate_block_cost(const uint8_t* data, size_t size) {
 } // anonymous namespace
 
 std::vector<BlockSplit> BlockSplitter::split(
-    const uint8_t* data, size_t size, size_t max_block_size) {
+    const uint8_t* /*data*/, size_t size, size_t max_block_size) {
 
     std::vector<BlockSplit> blocks;
     if (size == 0) return blocks;

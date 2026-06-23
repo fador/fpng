@@ -320,7 +320,6 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
 
         } else {
             // === Stochastic hill-climbing with restarts (levels 5-6) ===
-            const int RESTARTS = 5;
             const int MAX_STEPS = static_cast<int>(height) * 3;
 
             std::mt19937 rng(42);

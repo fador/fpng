@@ -182,7 +182,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
     // Auto-scale: reduce effort for large images
     auto strategies = get_strategies(opts.level);
-    bool is_small  = (raw_pixels < 8192);
+    bool is_small  = (raw_pixels < 16384);   // < 16KB raw
     bool is_large  = (raw_pixels >= 262144);
     bool is_huge   = (raw_pixels >= 1048576);
 
@@ -193,6 +193,13 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         // Skip GA strategies for large images (too slow)
         if ((is_large || is_huge) && s.filter_level >= 5) continue;
         if (is_huge && s.filter_level >= 3) continue;
+
+        // Skip expensive strategies for very small images (won't help)
+        if (is_small && s.filter_level >= 5) continue;
+        if (is_small && s.deflate_iterations >= 4) continue;
+
+        // Skip BT match finder strategies (correctness issues, WIP)
+        if (s.bt_match) continue;
 
         // Skip palette-sort for non-indexed photo images
         if (s.palette_sort && content.is_photographic && img.color_type != 3)
@@ -234,11 +241,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                   << " strategies (auto-scaled for " << raw_pixels << "px)\n";
     }
 
-    // Run strategies with size tracking for early termination
-    int threads = opts.num_threads;
-    if (threads <= 0) threads = std::max(1u, std::thread::hardware_concurrency());
-    if (is_large) threads = std::min(threads, 4); // don't thrash on large images
-
+    // Run strategies sequentially
     struct TrialResult {
         std::vector<uint8_t> data;
         Strategy strategy;
@@ -247,20 +250,9 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
     std::vector<TrialResult> results;
     results.reserve(filtered.size());
-    size_t best_size_so_far = std::numeric_limits<size_t>::max();
-    size_t best_strategy_idx = 0;
-
-    // Two-tier: fast proxy first, then re-compress top 3 with best settings
-    bool use_two_tier = (filtered.size() > 4) && !is_small;
 
     for (size_t si = 0; si < filtered.size(); ++si) {
         auto& s = filtered[si];
-
-        // Early skip: if this strategy is much more expensive than best so far
-        if (si > 2 && best_size_so_far < std::numeric_limits<size_t>::max()) {
-            int cost_diff = (s.filter_level - filtered[best_strategy_idx].filter_level) * 100;
-            if (cost_diff > 200) continue; // skip much more expensive strategies
-        }
 
         Image work = img;
         if (s.alpha_zero && (img.color_type == 6 || img.color_type == 4))
@@ -271,7 +263,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         FilterOptions fopts;
         fopts.level = s.filter_level;
         fopts.window_size = std::min(3, s.filter_level);
-        fopts.ga_population = std::min(s.filter_level * 5, 20); // scale GA down
+        fopts.ga_population = std::min(s.filter_level * 5, 20);
         fopts.ga_generations = std::min(s.filter_level * 5, 30);
         auto filters = optimize_filters(work, fopts);
 
@@ -291,27 +283,22 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
             std::memcpy(prev.data(), src, raw_ss);
         }
 
-        // Use fast deflate for proxy trials (faster)
         DeflateOptions dopts;
-        dopts.level = use_two_tier ? CompressionLevel::Fast : s.deflate_level;
-        dopts.iterations = use_two_tier ? 1 : s.deflate_iterations;
+        dopts.level = CompressionLevel::Fast; // proxy
+        dopts.iterations = 1;
         dopts.optimal_parsing = false;
-
-        auto compressed = zlib_compress(filtered_data, dopts);
+        dopts.bt_match_finder = s.bt_match;
+        if (s.bt_match || s.deflate_level >= CompressionLevel::Ultra)
+            dopts.chain_depth = 256;
 
         TrialResult tr;
-        tr.data = std::move(compressed);
+        tr.data = zlib_compress(filtered_data, dopts);
         tr.strategy = s;
         tr.size = tr.data.size();
         results.push_back(std::move(tr));
 
         if (opts.verbose)
             std::cout << "  " << s.name << ": " << tr.size << " bytes\n";
-
-        if (tr.size < best_size_so_far) {
-            best_size_so_far = tr.size;
-            best_strategy_idx = results.size() - 1;
-        }
     }
 
     // Find best

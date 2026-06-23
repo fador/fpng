@@ -19,6 +19,7 @@ public:
     BTMatchFinder() = default;
 
     void init(const uint8_t* data, size_t size) {
+        if (size > 8192) { size_ = 0; return; } // cap for performance
         data_ = data;
         size_ = size;
 
@@ -47,10 +48,11 @@ public:
 
         // Check smaller neighbor (predecessor in BST)
         int s = smaller_[pos];
-        while (s >= 0) {
+        int chain_count = 0;
+        while (s >= 0 && chain_count < MAX_WALK) {
             size_t candidate = static_cast<size_t>(s);
             if (pos - candidate > limit) break;
-            if (pos - candidate <= 1) { s = smaller_[candidate]; continue; }
+            if (pos - candidate <= 1) { s = smaller_[candidate]; ++chain_count; continue; }
 
             size_t match_len = simd::match_length(cur + min_len,
                                                    data_ + candidate + min_len,
@@ -61,14 +63,16 @@ public:
                 if (best.length == max_match) break;
             }
             s = smaller_[candidate];
+            ++chain_count;
         }
 
         // Check larger neighbor (successor in BST)
         int l = larger_[pos];
-        while (l >= 0) {
+        chain_count = 0;
+        while (l >= 0 && chain_count < MAX_WALK) {
             size_t candidate = static_cast<size_t>(l);
             if (pos - candidate > limit) break;
-            if (pos - candidate <= 1) { l = larger_[candidate]; continue; }
+            if (pos - candidate <= 1) { l = larger_[candidate]; ++chain_count; continue; }
 
             size_t match_len = simd::match_length(cur + min_len,
                                                    data_ + candidate + min_len,
@@ -79,6 +83,7 @@ public:
                 if (best.length == max_match) break;
             }
             l = larger_[candidate];
+            ++chain_count;
         }
 
         return best;
@@ -97,10 +102,11 @@ public:
         // Collect all distinct matches by walking both BST chains
         // "smaller" chain: predecessors (lexicographically smaller strings)
         int s = smaller_[pos];
-        while (s >= 0 && matches.size() < MAX_MATCHES) {
+        int walk_count = 0;
+        while (s >= 0 && matches.size() < MAX_MATCHES && walk_count < MAX_WALK) {
             size_t candidate = static_cast<size_t>(s);
             if (pos - candidate > limit) break;
-            if (pos - candidate <= 1) { s = smaller_[candidate]; continue; }
+            if (pos - candidate <= 1) { s = smaller_[candidate]; ++walk_count; continue; }
 
             size_t match_len = simd::match_length(cur + min_len,
                                                    data_ + candidate + min_len,
@@ -124,10 +130,11 @@ public:
 
         // "larger" chain: successors (lexicographically larger strings)
         int l = larger_[pos];
-        while (l >= 0 && matches.size() < MAX_MATCHES) {
+        walk_count = 0;
+        while (l >= 0 && matches.size() < MAX_MATCHES && walk_count < MAX_WALK) {
             size_t candidate = static_cast<size_t>(l);
             if (pos - candidate > limit) break;
-            if (pos - candidate <= 1) { l = larger_[candidate]; continue; }
+            if (pos - candidate <= 1) { l = larger_[candidate]; ++walk_count; continue; }
 
             size_t match_len = simd::match_length(cur + min_len,
                                                    data_ + candidate + min_len,
@@ -156,15 +163,20 @@ public:
     size_t data_size() const noexcept { return size_; }
 
 private:
-    static constexpr size_t MAX_WINDOW = deflate::MAX_DIST; // 32KB
+    static constexpr size_t MAX_WINDOW = deflate::MAX_DIST;
+    static constexpr int MAX_INSERT_DEPTH = 256;
+    static constexpr int MAX_WALK = 256;
 
     void insert(size_t pos) {
         int current = tree_root_;
         int* child_ptr = &tree_root_;
         int smaller = -1, larger = -1;
         const uint8_t* str = data_ + pos;
+        int depth = 0;
+        ++depth;
+        constexpr int MAX_INSERT_DEPTH = 256;
 
-        while (current >= 0) {
+        while (current >= 0 && depth < MAX_INSERT_DEPTH) {
             const uint8_t* other = data_ + current;
             // Compare strings to determine BST direction
             int cmp = 0;
@@ -184,6 +196,7 @@ private:
                     cmp = 1;
             }
 
+            ++depth;
             if (cmp < 0) {
                 larger = current;
                 child_ptr = &smaller_[current];
