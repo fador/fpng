@@ -58,6 +58,16 @@ private:
         return h & (HASH_SIZE - 1);
     }
 
+    // Hash four bytes offset by 1 (bytes 1-4) for dual-hash coverage
+    static uint32_t hash_off(const uint8_t* p) noexcept {
+        uint32_t h = 2654435761u;
+        h = (h ^ p[1]) * 16777619u;
+        h = (h ^ p[2]) * 16777619u;
+        h = (h ^ p[3]) * 16777619u;
+        h = (h ^ p[4]) * 16777619u;
+        return h & (HASH_SIZE - 1);
+    }
+
     // Secondary hash for sub-slot within a hash bucket (uses bytes 1-3)
     static int subslot_offset(const uint8_t* p) noexcept {
         return ((p[1] * 7 + p[2] * 3 + p[0]) >> 5) & (SUB_SLOTS - 1);
@@ -71,10 +81,12 @@ private:
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
 
-    // For each (hash, subslot) pair, the head of its chain
-    mutable std::vector<int32_t> heads_;
-    // For each position, the next position with the same (hash, subslot)
-    mutable std::vector<int32_t> prev_;
+    // Primary hash chain (bytes 0-3)
+    mutable std::vector<int32_t> heads1_;
+    mutable std::vector<int32_t> prev1_;
+    // Secondary hash chain (bytes 1-4) for wider coverage
+    mutable std::vector<int32_t> heads2_;
+    mutable std::vector<int32_t> prev2_;
 };
 
 // LZ77 parser with multiple strategies

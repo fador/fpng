@@ -7,26 +7,37 @@
 namespace fpng {
 
 MatchFinder::MatchFinder() {
-    heads_.resize(TOTAL_HEADS);
-    std::fill(heads_.begin(), heads_.end(), -1);
+    heads1_.resize(TOTAL_HEADS);
+    heads2_.resize(TOTAL_HEADS);
+    std::fill(heads1_.begin(), heads1_.end(), -1);
+    std::fill(heads2_.begin(), heads2_.end(), -1);
 }
 
 void MatchFinder::init(const uint8_t* data, size_t size) {
     data_ = data;
     size_ = size;
 
-    if (prev_.size() < size) {
-        prev_.resize(std::max(size, size_t(65536)));
+    if (prev1_.size() < size) {
+        prev1_.resize(std::max(size, size_t(65536)));
+        prev2_.resize(std::max(size, size_t(65536)));
     }
 
-    std::fill(heads_.begin(), heads_.end(), -1);
+    std::fill(heads1_.begin(), heads1_.end(), -1);
+    std::fill(heads2_.begin(), heads2_.end(), -1);
 
     for (size_t i = 0; i + 3 < size; ++i) {
         uint32_t h = hash4(data + i);
         int ss = subslot_offset(data + i);
         size_t idx = head_index(h, ss);
-        prev_[i] = heads_[idx];
-        heads_[idx] = static_cast<int32_t>(i);
+        prev1_[i] = heads1_[idx];
+        heads1_[idx] = static_cast<int32_t>(i);
+    }
+    for (size_t i = 0; i + 4 < size; ++i) {
+        uint32_t h = hash_off(data + i);
+        int ss = subslot_offset(data + i + 1); // subslot on bytes 2-4
+        size_t idx = head_index(h, ss);
+        prev2_[i] = heads2_[idx];
+        heads2_[idx] = static_cast<int32_t>(i);
     }
 }
 
@@ -37,16 +48,9 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
     size_t limit = std::min(pos, size_t(deflate::MAX_DIST));
     size_t max_match = std::min(size_ - pos, size_t(deflate::MAX_MATCH_LEN));
 
-    uint32_t h = hash4(cur);
-    int ss = subslot_offset(cur);
-    size_t idx = head_index(h, ss);
-    int32_t chain_pos = heads_[idx];
-
     LZMatch best{0, 0};
-    size_t chain_len = 0;
 
-    // Explicit between-row match check: the filter byte pattern repeats
-    // every row_stride bytes, which the hash chain may miss for deep data.
+    // Explicit between-row match check
     if (row_stride > 0 && pos >= static_cast<size_t>(row_stride)) {
         size_t row_pos = pos - static_cast<size_t>(row_stride);
         const uint8_t* row_cand = data_ + row_pos;
@@ -62,36 +66,45 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
         }
     }
 
-    while (chain_pos >= 0 && chain_len < chain_depth) {
-        size_t candidate = static_cast<size_t>(chain_pos);
-        if (candidate >= pos) { chain_pos = prev_[chain_pos]; ++chain_len; continue; }
-        if (pos - candidate > limit) break;
+    // Helper: walk one chain
+    auto walk_chain = [&](const std::vector<int32_t>& heads,
+                          const std::vector<int32_t>& prev,
+                          uint32_t hash_val, int subslot) {
+        size_t idx = head_index(hash_val, subslot);
+        int32_t chain_pos = heads[idx];
+        size_t chain_len = 0;
+        while (chain_pos >= 0 && chain_len < chain_depth) {
+            size_t candidate = static_cast<size_t>(chain_pos);
+            if (candidate >= pos) { chain_pos = prev[chain_pos]; ++chain_len; continue; }
+            if (pos - candidate > limit) break;
 
-        const uint8_t* cand = data_ + candidate;
+            const uint8_t* cand = data_ + candidate;
+            uint32_t cand32, cur32;
+            std::memcpy(&cand32, cand, 4);
+            std::memcpy(&cur32, cur, 4);
+            if (cand32 != cur32) {
+                chain_pos = prev[chain_pos];
+                ++chain_len;
+                continue;
+            }
 
-        // 4-byte quick check
-        uint32_t cand32, cur32;
-        std::memcpy(&cand32, cand, 4);
-        std::memcpy(&cur32, cur, 4);
-        if (cand32 != cur32) {
-            chain_pos = prev_[chain_pos];
+            size_t match_len = simd::match_length(cand + 4, cur + 4, max_match - 4) + 4;
+            if (match_len > best.length ||
+                (match_len == best.length && (pos - candidate) < best.distance)) {
+                best.length = static_cast<uint16_t>(match_len);
+                best.distance = static_cast<uint16_t>(pos - candidate);
+                if (match_len >= static_cast<size_t>(nice_len) || match_len == max_match)
+                    break;
+            }
+            chain_pos = prev[chain_pos];
             ++chain_len;
-            continue;
         }
+    };
 
-        size_t match_len = simd::match_length(cand + 4, cur + 4,
-                                               max_match - 4) + 4;
-
-        if (match_len > best.length) {
-            best.length = static_cast<uint16_t>(match_len);
-            best.distance = static_cast<uint16_t>(pos - candidate);
-            if (match_len == max_match) break;
-            if (match_len >= static_cast<size_t>(nice_len)) break;
-        }
-
-        chain_pos = prev_[chain_pos];
-        ++chain_len;
-    }
+    // Search both hash chains
+    walk_chain(heads1_, prev1_, hash4(cur), subslot_offset(cur));
+    if (best.length < static_cast<size_t>(nice_len) && best.length < max_match)
+        walk_chain(heads2_, prev2_, hash_off(cur), subslot_offset(cur + 1));
 
     return best;
 }
@@ -105,41 +118,40 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
     size_t limit = std::min(pos, size_t(deflate::MAX_DIST));
     size_t max_match = std::min(size_ - pos, size_t(deflate::MAX_MATCH_LEN));
 
-    uint32_t h = hash4(cur);
-    int ss = subslot_offset(cur);
-    size_t idx = head_index(h, ss);
-    int32_t chain_pos = heads_[idx];
+    // Helper: walk one chain and collect all matches
+    auto walk_chain_all = [&](const std::vector<int32_t>& heads,
+                               const std::vector<int32_t>& prev,
+                               uint32_t hash_val, int subslot) {
+        size_t idx = head_index(hash_val, subslot);
+        int32_t chain_pos = heads[idx];
+        size_t chain_len = 0;
+        while (chain_pos >= 0 && chain_len < chain_depth) {
+            size_t candidate = static_cast<size_t>(chain_pos);
+            if (candidate >= pos) { chain_pos = prev[chain_pos]; ++chain_len; continue; }
+            if (pos - candidate > limit) break;
 
-    size_t chain_len = 0;
-    while (chain_pos >= 0 && chain_len < chain_depth) {
-        size_t candidate = static_cast<size_t>(chain_pos);
-        if (candidate >= pos) { chain_pos = prev_[chain_pos]; ++chain_len; continue; }
-        if (pos - candidate > limit) break;
+            const uint8_t* cand = data_ + candidate;
+            uint32_t cand32, cur32;
+            std::memcpy(&cand32, cand, 4);
+            std::memcpy(&cur32, cur, 4);
+            if (cand32 != cur32) {
+                chain_pos = prev[chain_pos];
+                ++chain_len;
+                continue;
+            }
 
-        const uint8_t* cand = data_ + candidate;
-
-        // 4-byte quick check
-        uint32_t cand32, cur32;
-        std::memcpy(&cand32, cand, 4);
-        std::memcpy(&cur32, cur, 4);
-        if (cand32 != cur32) {
-            chain_pos = prev_[chain_pos];
+            size_t match_len = simd::match_length(cand + 4, cur + 4, max_match - 4) + 4;
+            if (match_len >= 4) {
+                matches.push_back({static_cast<uint16_t>(match_len),
+                                   static_cast<uint16_t>(pos - candidate)});
+            }
+            chain_pos = prev[chain_pos];
             ++chain_len;
-            continue;
         }
+    };
 
-        size_t match_len = simd::match_length(cand + 4, cur + 4,
-                                               max_match - 4) + 4;
-        if (match_len >= 4) {
-            matches.push_back({
-                static_cast<uint16_t>(match_len),
-                static_cast<uint16_t>(pos - candidate)
-            });
-        }
-
-        chain_pos = prev_[chain_pos];
-        ++chain_len;
-    }
+    walk_chain_all(heads1_, prev1_, hash4(cur), subslot_offset(cur));
+    walk_chain_all(heads2_, prev2_, hash_off(cur), subslot_offset(cur + 1));
 }
 
 // LZ77Parser implementation
