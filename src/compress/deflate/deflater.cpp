@@ -190,7 +190,7 @@ void write_dynamic_block(const uint8_t* data, size_t size,
             // use actual Huffman code lengths from previous pass instead of
             // entropy estimates. Entropy is more accurate for small data where
             // frequency distributions are stable after one pass.
-            if (!prev_ll_len.empty()) {
+            if (!prev_ll_len.empty() && iters >= 3) {
                 cm.litlen_lengths = prev_ll_len.data();
                 cm.dist_lengths = prev_d_len.data();
                 cm.precomputed_costs = nullptr; // use Huffman lengths
@@ -507,10 +507,10 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
         // Sorted-array match finder: no false positives, every step is a real
         // match. Shallower depths suffice vs hash chains.
         switch (adjusted.level) {
-            case CompressionLevel::Fast:    adjusted.chain_depth = 256;  break;
-            case CompressionLevel::Default: adjusted.chain_depth = 512;  break;
-            case CompressionLevel::Best:    adjusted.chain_depth = 2048; break;
-            case CompressionLevel::Ultra:   adjusted.chain_depth = 4096; break;
+            case CompressionLevel::Fast:    adjusted.chain_depth = 128;  break;
+            case CompressionLevel::Default: adjusted.chain_depth = 1024;  break;
+            case CompressionLevel::Best:    adjusted.chain_depth = 4096; break;
+            case CompressionLevel::Ultra:   adjusted.chain_depth = 8192; break;
             default: adjusted.chain_depth = 128; break;
         }
     }
