@@ -34,6 +34,7 @@ public:
 
     size_t chain_depth = 128; // Hash chain walk limit (set before init)
     int nice_len = 32;         // Early exit when match >= this length
+    int row_stride = 0;        // If >0, also check match at this distance (for between-row)
 
 private:
     static constexpr size_t HASH_SIZE = 262144;
@@ -47,12 +48,14 @@ private:
                  static_cast<uint32_t>(p[2])) & (HASH_SIZE - 1);
     }
 
-    // Hash four bytes (better discrimination for common prefixes)
+    // Hash four bytes using FNV-1a style mixing for better distribution
     static uint32_t hash4(const uint8_t* p) noexcept {
-        return ((static_cast<uint32_t>(p[0]) << 10) ^
-                (static_cast<uint32_t>(p[1]) << 5) ^
-                 static_cast<uint32_t>(p[2]) ^
-                (static_cast<uint32_t>(p[3]) << 15)) & (HASH_SIZE - 1);
+        uint32_t h = 2166136261u;
+        h = (h ^ p[0]) * 16777619u;
+        h = (h ^ p[1]) * 16777619u;
+        h = (h ^ p[2]) * 16777619u;
+        h = (h ^ p[3]) * 16777619u;
+        return h & (HASH_SIZE - 1);
     }
 
     // Secondary hash for sub-slot within a hash bucket (uses bytes 1-3)
@@ -107,6 +110,7 @@ public:
         int  min_match = deflate::MIN_MATCH_LEN;
         int  chain_depth = 128;
         int  nice_len = 32;
+        int  row_stride = 0;  // >0: also check match at this distance
         CostModel cost_model;
     };
 

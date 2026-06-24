@@ -45,6 +45,23 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
     LZMatch best{0, 0};
     size_t chain_len = 0;
 
+    // Explicit between-row match check: the filter byte pattern repeats
+    // every row_stride bytes, which the hash chain may miss for deep data.
+    if (row_stride > 0 && pos >= static_cast<size_t>(row_stride)) {
+        size_t row_pos = pos - static_cast<size_t>(row_stride);
+        const uint8_t* row_cand = data_ + row_pos;
+        uint32_t rc32, cur32;
+        std::memcpy(&rc32, row_cand, 4);
+        std::memcpy(&cur32, cur, 4);
+        if (rc32 == cur32) {
+            size_t match_len = simd::match_length(row_cand + 4, cur + 4, max_match - 4) + 4;
+            best.length = static_cast<uint16_t>(match_len);
+            best.distance = static_cast<uint16_t>(row_stride);
+            if (match_len >= static_cast<size_t>(nice_len) || match_len == max_match)
+                return best;
+        }
+    }
+
     while (chain_pos >= 0 && chain_len < chain_depth) {
         size_t candidate = static_cast<size_t>(chain_pos);
         if (candidate >= pos) { chain_pos = prev_[chain_pos]; ++chain_len; continue; }
@@ -152,6 +169,7 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_greedy(
     MatchFinder mf;
     mf.chain_depth = opts.chain_depth;
     mf.nice_len = opts.nice_len;
+    mf.row_stride = opts.row_stride;
     mf.init(data, size);
 
     size_t pos = 0;
@@ -265,6 +283,7 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
     MatchFinder mf;
     mf.chain_depth = opts.chain_depth;
     mf.nice_len = opts.nice_len;
+    mf.row_stride = opts.row_stride;
     mf.init(data, size);
 
     std::vector<LZMatch> matches;

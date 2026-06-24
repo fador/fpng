@@ -104,6 +104,10 @@ void write_fixed_block(const uint8_t* data, size_t size,
         if (iter == 0) {
             parse_opts.optimal = false;
             parse_opts.lazy_matching = true;
+            // Auto-detect row stride for filtered PNG data: if data size
+            // divided by 769 produces a clean integer, it's likely 256-wide RGB
+            parse_opts.row_stride = 0;
+            if (size >= 769 && size % 769 == 0) parse_opts.row_stride = 769;
         } else {
             parse_opts.optimal = true;
             parse_opts.cost_model = cm;
@@ -184,6 +188,10 @@ void write_dynamic_block(const uint8_t* data, size_t size,
             parse_opts.optimal = false;
             // Lazy matching is counterproductive at deep chain depths
             parse_opts.lazy_matching = true;
+            // Auto-detect row stride for filtered PNG data: if data size
+            // divided by 769 produces a clean integer, it's likely 256-wide RGB
+            parse_opts.row_stride = 0;
+            if (size >= 769 && size % 769 == 0) parse_opts.row_stride = 769;
         } else {
             parse_opts.optimal = true;
             LZ77Parser::CostModel cm;
