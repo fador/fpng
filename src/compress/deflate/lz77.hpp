@@ -36,7 +36,7 @@ public:
     int nice_len = 32;         // Early exit when match >= this length
 
 private:
-    static constexpr size_t HASH_SIZE = 65536;
+    static constexpr size_t HASH_SIZE = 262144;
     static constexpr size_t SUB_SLOTS = 16;
     static constexpr size_t TOTAL_HEADS = HASH_SIZE * SUB_SLOTS;
 
