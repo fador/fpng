@@ -31,6 +31,10 @@ public:
     size_t chain_depth = 128; // max matches to examine per position
     int nice_len = 32;
     int row_stride = 0;
+    // Cost model fields for accurate scoring (populated from LZ77Parser::CostModel)
+    const uint16_t* precomputed_costs = nullptr;
+    const uint8_t* litlen_lengths = nullptr;
+    const uint8_t* dist_lengths = nullptr;
 
 private:
     static constexpr size_t INDEX_BITS = 16;
