@@ -115,6 +115,36 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
     if (best.length < static_cast<size_t>(nice_len) && best.length < max_match)
         walk_chain(heads2_, prev2_, hash_off(cur), subslot_offset(cur + 1));
 
+    // Close-distance scan: catch distance-1 matches the hash chain may
+    // miss due to bucket collisions on common byte prefixes.
+    if (best.length < 4 && pos > 0) {
+        constexpr size_t SCAN_RANGE = 4;
+        size_t scan_end = std::min(pos, SCAN_RANGE);
+        for (size_t d = 1; d <= scan_end; ++d) {
+            size_t cand_pos = pos - d;
+            const uint8_t* cand = data_ + cand_pos;
+            uint32_t c32, cur32;
+            std::memcpy(&c32, cand, 4);
+            std::memcpy(&cur32, cur, 4);
+            // Only check if bytes differ (fast rejection)
+            if (c32 != cur32) continue;
+            
+            size_t mlen = simd::match_length(cand + 4, cur + 4, max_match - 4) + 4;
+            int dc = deflate::distance_code(static_cast<uint16_t>(d));
+            int extra = deflate::distance_extra_bits(dc);
+            int new_score = static_cast<int>(mlen) * 256 - extra * 32;
+            int bdc = deflate::distance_code(best.distance);
+            int bextra = deflate::distance_extra_bits(bdc);
+            int best_score = static_cast<int>(best.length) * 256 - bextra * 32;
+            if (new_score > best_score || (new_score == best_score && d < best.distance)) {
+                best.length = static_cast<uint16_t>(mlen);
+                best.distance = static_cast<uint16_t>(d);
+                best_score = new_score;
+                if (mlen >= max_match || mlen >= static_cast<size_t>(nice_len)) goto done;
+            }
+        }
+    }
+    done:
     return best;
 }
 
