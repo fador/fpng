@@ -422,7 +422,8 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                 dopts.iterations = std::min(dopts.iterations, 1);
                 dopts.level = CompressionLevel::Best;
             } else if (is_large) {
-                dopts.iterations = std::min(dopts.iterations, 3);
+                // Bump to at least 3 iterations for Huffman cost feedback on iter 3
+                dopts.iterations = std::max(std::min(dopts.iterations, 3), 3);
             }
             dopts.optimal_parsing = (dopts.iterations > 1);
             dopts.chain_depth = 0; // auto-select based on level

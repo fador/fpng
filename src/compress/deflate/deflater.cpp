@@ -174,22 +174,29 @@ void write_dynamic_block(const uint8_t* data, size_t size,
     int iters = std::max(1, opts.iterations);
     std::vector<LZ77Parser::Token> tokens;
     std::vector<uint8_t> ll_len, d_len;
-    // Store entropy costs for the CostModel (recomputed each iteration)
+    // Store entropy costs for the first DP pass
     std::vector<uint16_t> entropy_costs;
+    // Store actual Huffman code lengths from previous iteration for feedback
+    std::vector<uint8_t> prev_ll_len, prev_d_len;
+    LZ77Parser::CostModel cm;
 
     for (int iter = 0; iter < iters; ++iter) {
         if (iter == 0) {
             parse_opts.optimal = false;
-            // Lazy matching is counterproductive at deep chain depths
             parse_opts.lazy_matching = true;
-            // Auto-detect row stride for filtered PNG data: if data size
-            // divided by 769 produces a clean integer, it's likely 256-wide RGB
-            parse_opts.row_stride = 0;
-            if (size >= 769 && size % 769 == 0) parse_opts.row_stride = 769;
         } else {
             parse_opts.optimal = true;
-            LZ77Parser::CostModel cm;
-            cm.precomputed_costs = entropy_costs.data();
+            // Zopfli-style Huffman feedback: for large data or high iterations,
+            // use actual Huffman code lengths from previous pass instead of
+            // entropy estimates. Entropy is more accurate for small data where
+            // frequency distributions are stable after one pass.
+            if (!prev_ll_len.empty()) {
+                cm.litlen_lengths = prev_ll_len.data();
+                cm.dist_lengths = prev_d_len.data();
+                cm.precomputed_costs = nullptr; // use Huffman lengths
+            } else {
+                cm.precomputed_costs = entropy_costs.data(); // entropy
+            }
             parse_opts.cost_model = cm;
         }
         tokens = parser.parse(data, size, parse_opts);
@@ -214,6 +221,10 @@ void write_dynamic_block(const uint8_t* data, size_t size,
         // Build Huffman trees (needed for final encoding)
         ll_len = HuffmanEncoder::compute_lengths(ll_freq, deflate::MAX_LITLEN_SYMS, 15);
         d_len = HuffmanEncoder::compute_lengths(d_freq, deflate::MAX_DIST_SYMS, 15);
+
+        // Save for next iteration's CostModel (Zopfli-style feedback)
+        prev_ll_len = ll_len;
+        prev_d_len = d_len;
     }
 
      // Now we have the final tokens and Huffman trees
