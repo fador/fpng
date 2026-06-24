@@ -16,7 +16,8 @@ namespace {
 // Compute entropy-based costs from symbol frequencies.
 // Returns a 288+32 entry vector of scaled fixed-point costs (scale=1024).
 // cost[sym] = ceil(-log2(freq[sym] / total) * 1024)
-// Unused symbols get a high cost to discourage their use.
+// Unused symbols get a fallback cost (seeded with freq=1) instead of 65535
+// to prevent the DP parser from being locked out of favorable matches.
 std::vector<uint16_t> compute_entropy_costs(
     const uint32_t* ll_freq, const uint32_t* d_freq) {
 
@@ -27,9 +28,13 @@ std::vector<uint16_t> compute_entropy_costs(
     for (int i = 0; i < 288; ++i) ll_total += ll_freq[i];
     if (ll_total == 0) ll_total = 1;
 
-    // Compute total distance frequency
+    // Compute total distance frequency, seeding unused codes with freq=1
     uint64_t d_total = 0;
-    for (int i = 0; i < 32; ++i) d_total += d_freq[i];
+    int d_added = 0;
+    for (int i = 0; i < 32; ++i) {
+        if (d_freq[i] > 0) d_total += d_freq[i];
+        else { d_total += 1; d_added++; }
+    }
     if (d_total == 0) d_total = 1;
 
     constexpr int SCALE = 1024;
@@ -42,20 +47,17 @@ std::vector<uint16_t> compute_entropy_costs(
             costs[i] = static_cast<uint16_t>(std::ceil(bits * SCALE));
             if (costs[i] == 0) costs[i] = 1; // minimum 1/1024 bit
         } else {
-            costs[i] = 65535; // effectively infinite for unused symbols
+            costs[i] = 65535; // literal/length: keep frozen (256 literal values, most appear)
         }
     }
 
     for (int i = 0; i < 32; ++i) {
         int idx = 288 + i;
-        if (d_freq[i] > 0) {
-            double p = static_cast<double>(d_freq[i]) / d_total;
-            double bits = -std::log(p) * log2e;
-            costs[idx] = static_cast<uint16_t>(std::ceil(bits * SCALE));
-            if (costs[idx] == 0) costs[idx] = 1;
-        } else {
-            costs[idx] = 65535;
-        }
+        uint32_t freq = d_freq[i] > 0 ? d_freq[i] : 1; // seed unused with 1
+        double p = static_cast<double>(freq) / d_total;
+        double bits = -std::log(p) * log2e;
+        costs[idx] = static_cast<uint16_t>(std::ceil(bits * SCALE));
+        if (costs[idx] == 0) costs[idx] = 1;
     }
 
     return costs;
@@ -104,36 +106,28 @@ void write_fixed_block(const uint8_t* data, size_t size,
         if (iter == 0) {
             parse_opts.optimal = false;
             parse_opts.lazy_matching = true;
-            // Auto-detect row stride for filtered PNG data: if data size
-            // divided by 769 produces a clean integer, it's likely 256-wide RGB
+            // Auto-detect row stride
             parse_opts.row_stride = 0;
             if (size >= 769 && size % 769 == 0) parse_opts.row_stride = 769;
         } else {
             parse_opts.optimal = true;
+            // Use actual fixed Huffman costs, not entropy estimates.
+            // Fixed Huffman: litlen 0-143=8, 144-255=9, EOB=7, 257-279=7,
+            // 280-285=8, distance=5. These are the costs the encoder uses.
+            static std::vector<uint16_t> fixed_costs;
+            if (fixed_costs.empty()) {
+                fixed_costs.resize(288 + 32);
+                for (int i = 0; i <= 143; ++i) fixed_costs[i] = 8 * 1024;
+                for (int i = 144; i <= 255; ++i) fixed_costs[i] = 9 * 1024;
+                fixed_costs[256] = 7 * 1024; // EOB
+                for (int i = 257; i <= 279; ++i) fixed_costs[i] = 7 * 1024;
+                for (int i = 280; i <= 285; ++i) fixed_costs[i] = 8 * 1024;
+                for (int i = 0; i < 32; ++i) fixed_costs[288 + i] = 5 * 1024;
+            }
+            cm.precomputed_costs = fixed_costs.data();
             parse_opts.cost_model = cm;
         }
         tokens = parser.parse(data, size, parse_opts);
-
-            if (iter + 1 < iters) {
-            // Count frequencies from current tokens
-            uint32_t ll_freq[deflate::MAX_LITLEN_SYMS] = {};
-            uint32_t d_freq[deflate::MAX_DIST_SYMS] = {};
-            for (size_t i = 0; i + 1 < tokens.size(); ++i) {
-                auto& t = tokens[i];
-                if (t.type == LZ77Parser::Token::LITERAL) {
-                    ll_freq[t.literal]++;
-                } else {
-                    ll_freq[257 + deflate::length_code(t.match_length)]++;
-                    d_freq[deflate::distance_code(t.match_distance)]++;
-                }
-            }
-            ll_freq[256] = 1;
-
-            // Use entropy-based costs instead of fixed Huffman lengths
-            static std::vector<uint16_t> entropy_costs_fixed;
-            entropy_costs_fixed = compute_entropy_costs(ll_freq, d_freq);
-            cm.precomputed_costs = entropy_costs_fixed.data();
-        }
     }
 
     BitWriter bw;

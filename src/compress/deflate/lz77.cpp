@@ -89,10 +89,19 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
             }
 
             size_t match_len = simd::match_length(cand + 4, cur + 4, max_match - 4) + 4;
-            if (match_len > best.length ||
-                (match_len == best.length && (pos - candidate) < best.distance)) {
+            // Cost-aware: prefer longer matches but reward closer distances.
+            // Score = length*256 - distance_extra_bits*32.
+            uint16_t cdist = static_cast<uint16_t>(pos - candidate);
+            int cdc = deflate::distance_code(cdist);
+            int cextra = deflate::distance_extra_bits(cdc);
+            int bdc = deflate::distance_code(best.distance);
+            int bextra = deflate::distance_extra_bits(bdc);
+            int new_score = static_cast<int>(match_len) * 256 - cextra * 32;
+            int best_score = static_cast<int>(best.length) * 256 - bextra * 32;
+            if (new_score > best_score ||
+                (new_score == best_score && cdist < best.distance)) {
                 best.length = static_cast<uint16_t>(match_len);
-                best.distance = static_cast<uint16_t>(pos - candidate);
+                best.distance = cdist;
                 if (match_len >= static_cast<size_t>(nice_len) || match_len == max_match)
                     break;
             }
