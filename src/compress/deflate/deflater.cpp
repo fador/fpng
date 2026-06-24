@@ -330,9 +330,8 @@ void write_dynamic_block(const uint8_t* data, size_t size,
                     if (run >= 3) {
                         // Code 16: repeat previous length 3-6 times
                         int cost_16 = clen_len[16] + 2;
-                        int cost_individual = run * clen_len[len];
                         int n = std::min(run, 6);
-                        if (cost_16 <= cost_individual * n) {
+                        if (cost_16 <= n * clen_len[len]) {
                             tree_rle.push_back(16);
                             tree_rle.push_back(static_cast<uint8_t>(n - 3));
                             i += n;
@@ -473,9 +472,9 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
     }
 
     // Use fixed Huffman blocks for compression.
-    // Auto-scale: for large images (>=128K bytes filtered), use 8192-byte
-    // blocks to specialize Huffman trees per data region. For smaller
-    // images, use a single 65536-byte block to minimize tree overhead.
+    // Auto-scale: for images >= 32K bytes filtered, use 8192-byte blocks
+    // to specialize Huffman trees per data region. For smaller images,
+    // use a single 65536-byte block to minimize tree overhead.
     size_t eff_block_size = opts.max_block_size;
     if (eff_block_size == 0) {
         eff_block_size = (data.size() >= 131072) ? 8192 : 65536;
@@ -494,11 +493,13 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
     // Version with explicit opts
     DeflateOptions adjusted = opts;
     if (adjusted.chain_depth == 0) {
+        // Sorted-array match finder: no false positives, every step is a real
+        // match. Shallower depths suffice vs hash chains.
         switch (adjusted.level) {
-            case CompressionLevel::Fast:    adjusted.chain_depth = 128;  break;
-            case CompressionLevel::Default: adjusted.chain_depth = 1024; break;
-            case CompressionLevel::Best:    adjusted.chain_depth = 4096; break;
-            case CompressionLevel::Ultra:   adjusted.chain_depth = 8192; break;
+            case CompressionLevel::Fast:    adjusted.chain_depth = 256;  break;
+            case CompressionLevel::Default: adjusted.chain_depth = 512;  break;
+            case CompressionLevel::Best:    adjusted.chain_depth = 2048; break;
+            case CompressionLevel::Ultra:   adjusted.chain_depth = 4096; break;
             default: adjusted.chain_depth = 128; break;
         }
     }

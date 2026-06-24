@@ -92,6 +92,27 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
         ++scanned;
     }
 
+    // Row-stride probe: the filter byte at row boundaries means the 4-byte
+    // tag at pos and (pos - row_stride) may differ. Explicitly check this
+    // distance — common for between-row matches in filtered PNG data.
+    if (row_stride > 0 && pos >= static_cast<size_t>(row_stride) &&
+        best.length < static_cast<size_t>(nice_len)) {
+        size_t row_pos = pos - static_cast<size_t>(row_stride);
+        size_t mlen = simd::match_length(data_ + row_pos, cur, max_match);
+        if (mlen >= 4) {
+            int dc = deflate::distance_code(static_cast<uint16_t>(row_stride));
+            int extra = deflate::distance_extra_bits(dc);
+            int new_score = static_cast<int>(mlen) * 256 - extra * 32;
+            int bdc = deflate::distance_code(best.distance);
+            int bextra = deflate::distance_extra_bits(bdc);
+            int best_score = static_cast<int>(best.length) * 256 - bextra * 32;
+            if (new_score > best_score) {
+                best.length = static_cast<uint16_t>(mlen);
+                best.distance = static_cast<uint16_t>(row_stride);
+            }
+        }
+    }
+
     return best;
 }
 

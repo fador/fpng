@@ -312,7 +312,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         }
 
         DeflateOptions dopts;
-        dopts.level = CompressionLevel::Fast;
+        dopts.level = CompressionLevel::Default; // better proxy fidelity than Fast
         dopts.iterations = 1;
         dopts.optimal_parsing = false;
         dopts.adaptive_blocks = !is_huge; // adaptive for all but huge images
@@ -417,7 +417,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
             DeflateOptions dopts;
             dopts.level = strat.deflate_level;
             dopts.iterations = strat.deflate_iterations;
-            dopts.adaptive_blocks = !is_huge && !is_large;
+            dopts.adaptive_blocks = !is_huge; // adaptive for all but huge
             if (is_huge) {
                 dopts.iterations = std::min(dopts.iterations, 1);
                 dopts.level = CompressionLevel::Best;
@@ -504,14 +504,14 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                     h.it == s2.deflate_iterations && h.az == s2.alpha_zero &&
                     h.ps == s2.palette_sort) continue;
 
-                // Skip if dual-variant (would be too slow)
+                // Allow up to 2 parameter changes (not just 1)
                 int changes = 0;
                 if (h.fl != s1.filter_level) ++changes;
                 if (h.dl != s1.deflate_level) ++changes;
                 if (h.it != s1.deflate_iterations) ++changes;
                 if (h.az != s1.alpha_zero) ++changes;
                 if (h.ps != s1.palette_sort) ++changes;
-                if (changes != 1) continue;
+                if (changes > 2) continue;
 
                 Image work = img;
                 if (h.az && (img.color_type == 6 || img.color_type == 4))
