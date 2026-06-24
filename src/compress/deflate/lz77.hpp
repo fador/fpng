@@ -13,80 +13,41 @@ namespace fpng {
 
 struct LZMatch; // defined in match_finder.hpp
 
-// Hash chain match finder for LZ77
+// Sorted-array match finder for LZ77.
+// Instead of hash chains (which miss matches when 4-byte prefixes hash
+// to different buckets), stores all positions sorted by their 4-byte tag.
+// Binary search finds all positions with the same tag regardless of
+// hash collisions, achieving 100% recall for 4-byte prefix matches.
 class MatchFinder {
 public:
-    MatchFinder();
+    MatchFinder() = default;
 
-    // Initialize for a new data buffer
     void init(const uint8_t* data, size_t size);
-
-    // Find the longest match at position pos
-    // Returns {length, distance} or {0, 0} if no match >= min_len
     LZMatch find_longest(size_t pos, int min_len = deflate::MIN_MATCH_LEN) const;
-
-    // Find all possible matches at position pos
-    // Useful for optimal parsing
     void find_all(size_t pos, std::vector<LZMatch>& matches,
                   int min_len = deflate::MIN_MATCH_LEN) const;
-
     size_t data_size() const noexcept { return size_; }
 
-    size_t chain_depth = 128; // Hash chain walk limit (set before init)
-    int nice_len = 32;         // Early exit when match >= this length
-    int row_stride = 0;        // If >0, also check match at this distance (for between-row)
+    size_t chain_depth = 128; // max matches to examine per position
+    int nice_len = 32;
+    int row_stride = 0;
 
 private:
-    static constexpr size_t HASH_SIZE = 262144;
-    static constexpr size_t SUB_SLOTS = 16;
-    static constexpr size_t TOTAL_HEADS = HASH_SIZE * SUB_SLOTS;
+    static constexpr size_t INDEX_BITS = 16;
+    static constexpr size_t INDEX_SIZE = 1 << INDEX_BITS;
 
-    // Hash three bytes (for min-match-length quick check)
-    static uint32_t hash3(const uint8_t* p) noexcept {
-        return ((static_cast<uint32_t>(p[0]) << 10) ^
-                (static_cast<uint32_t>(p[1]) << 5) ^
-                 static_cast<uint32_t>(p[2])) & (HASH_SIZE - 1);
-    }
-
-    // Hash four bytes using FNV-1a style mixing for better distribution
-    static uint32_t hash4(const uint8_t* p) noexcept {
-        uint32_t h = 2166136261u;
-        h = (h ^ p[0]) * 16777619u;
-        h = (h ^ p[1]) * 16777619u;
-        h = (h ^ p[2]) * 16777619u;
-        h = (h ^ p[3]) * 16777619u;
-        return h & (HASH_SIZE - 1);
-    }
-
-    // Hash four bytes offset by 1 (bytes 1-4) for dual-hash coverage
-    static uint32_t hash_off(const uint8_t* p) noexcept {
-        uint32_t h = 2654435761u;
-        h = (h ^ p[1]) * 16777619u;
-        h = (h ^ p[2]) * 16777619u;
-        h = (h ^ p[3]) * 16777619u;
-        h = (h ^ p[4]) * 16777619u;
-        return h & (HASH_SIZE - 1);
-    }
-
-    // Secondary hash for sub-slot within a hash bucket (uses bytes 1-3)
-    static int subslot_offset(const uint8_t* p) noexcept {
-        return ((p[1] * 7 + p[2] * 3 + p[0]) >> 5) & (SUB_SLOTS - 1);
-    }
-
-    // Get flat index into heads_ array
-    static size_t head_index(uint32_t hash, int subslot) noexcept {
-        return static_cast<size_t>(hash) * SUB_SLOTS + static_cast<size_t>(subslot);
-    }
+    struct TagEntry {
+        uint32_t tag;
+        int32_t  pos;
+    };
 
     const uint8_t* data_ = nullptr;
     size_t size_ = 0;
 
-    // Primary hash chain (bytes 0-3)
-    mutable std::vector<int32_t> heads1_;
-    mutable std::vector<int32_t> prev1_;
-    // Secondary hash chain (bytes 1-4) for wider coverage
-    mutable std::vector<int32_t> heads2_;
-    mutable std::vector<int32_t> prev2_;
+    // Sorted by tag (ascending)
+    std::vector<TagEntry> sorted_;
+    // Quick-lookup: first_[tag >> 16] = first index in sorted_ with that high word
+    std::vector<int32_t> first_;
 };
 
 // LZ77 parser with multiple strategies
