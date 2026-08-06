@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <vector>
 #include <span>
+#include <string>
 
 namespace fpng {
 

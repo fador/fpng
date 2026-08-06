@@ -234,53 +234,14 @@ void write_dynamic_block(const uint8_t* data, size_t size,
     int hdist = 30;
     while (hdist > 1 && d_len[hdist - 1] == 0) --hdist;
 
-    // Step 4: RLE encode the tree description
+    // Step 4-5: Build CLEN tree from the code-length frequencies directly.
     std::vector<uint8_t> tree_rle;
-    // Write each code length, with RLE for repeats
-    auto rle = [&](const uint8_t* lengths, int count) {
-        int i = 0;
-        while (i < count) {
-            uint8_t len = lengths[i];
-            if (len == 0) {
-                int run = 0;
-                while (i + run < count && lengths[i + run] == 0) ++run;
-                if (run < 3) {
-                    for (int r = 0; r < run; ++r) tree_rle.push_back(0);
-                } else if (run <= 10) {
-                    tree_rle.push_back(17);
-                    tree_rle.push_back(static_cast<uint8_t>(run - 3));
-                } else {
-                    int n = std::min(run, 138);
-                    tree_rle.push_back(18);
-                    tree_rle.push_back(static_cast<uint8_t>(n - 11));
-                    i += n;
-                    continue;
-                }
-                i += run;
-            } else {
-                tree_rle.push_back(len);
-                ++i;
-                int run = 0;
-                while (i + run < count && lengths[i + run] == len) ++run;
-                if (run >= 3) {
-                    int n = std::min(run, 6);
-                    tree_rle.push_back(16);
-                    tree_rle.push_back(static_cast<uint8_t>(n - 3));
-                    i += n;
-                }
-            }
-        }
-    };
-    rle(ll_len.data(), hlit);
-    rle(d_len.data(), hdist);
-
-    // Step 5: Build CLEN tree from tree_rle frequencies
     uint32_t clen_freq[deflate::MAX_CLEN_SYMS] = {};
-    for (size_t i = 0; i < tree_rle.size(); ++i) {
-        uint8_t v = tree_rle[i];
-        if (v < 16) clen_freq[v]++;
-        else { clen_freq[v]++; i++; } // skip extra bits byte
-    }
+    for (int i = 0; i < hlit; ++i) clen_freq[ll_len[i]]++;
+    for (int i = 0; i < hdist; ++i) clen_freq[d_len[i]]++;
+    clen_freq[16] = std::max(clen_freq[16], 1u);
+    clen_freq[17] = std::max(clen_freq[17], 1u);
+    clen_freq[18] = std::max(clen_freq[18], 1u);
 
     auto clen_len = HuffmanEncoder::compute_lengths(clen_freq, deflate::MAX_CLEN_SYMS, 7);
     auto clen_code = HuffmanEncoder::lengths_to_codes(clen_len.data(), deflate::MAX_CLEN_SYMS);

@@ -15,7 +15,75 @@
 #include <fstream>
 #include <sstream>
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace fs = std::filesystem;
+
+#if defined(_WIN32)
+#define FPNG_OS_WINDOWS
+#endif
+
+// Shared temp directory for benchmark outputs.
+static fs::path bench_dir() {
+#ifdef FPNG_OS_WINDOWS
+    static fs::path p = fs::temp_directory_path() / "fpng_bench";
+#else
+    static fs::path p = fs::path("/tmp/fpng_bench");
+#endif
+    return p;
+}
+
+// Cross-platform shell helpers.
+static std::string null_dev() {
+#ifdef FPNG_OS_WINDOWS
+    return "nul";
+#else
+    return "/dev/null";
+#endif
+}
+
+static std::string which_cmd(const std::string& cmd) {
+#ifdef FPNG_OS_WINDOWS
+    return "where " + cmd + " > " + null_dev() + " 2>&1";
+#else
+    return "which " + cmd + " > " + null_dev() + " 2>&1";
+#endif
+}
+
+static std::string exe_suffix() {
+#ifdef FPNG_OS_WINDOWS
+    return ".exe";
+#else
+    return "";
+#endif
+}
+
+// Resolve the fpng executable path, relative to this benchmark's own location
+// so it works regardless of the build directory layout.
+static std::string get_fpng_path() {
+    static std::string cached;
+    if (!cached.empty()) return cached;
+    fs::path self;
+#ifdef FPNG_OS_WINDOWS
+    {
+        char buf[MAX_PATH];
+        GetModuleFileNameA(NULL, buf, MAX_PATH);
+        self = fs::path(buf).parent_path();
+    }
+#else
+    {
+        std::string link = "/proc/self/exe";
+        fs::path p(link);
+        std::error_code ec;
+        if (fs::exists(p, ec)) self = fs::read_symlink(p, ec).parent_path();
+        else self = fs::current_path();
+    }
+#endif
+    cached = (self / ("fpng" + exe_suffix())).string();
+    return cached;
+}
 
 struct ToolResult {
     std::string tool;
@@ -33,8 +101,7 @@ struct BenchmarkResult {
 
 // Check if a command exists
 static bool command_exists(const std::string& cmd) {
-    std::string test = "which " + cmd + " > /dev/null 2>&1";
-    return std::system(test.c_str()) == 0;
+    return std::system(which_cmd(cmd).c_str()) == 0;
 }
 
 // Run a tool on a file
@@ -43,32 +110,50 @@ static ToolResult run_tool(const std::string& tool, const std::string& input,
     ToolResult r;
     r.tool = tool;
 
+    std::string dev_null = null_dev();
+    std::string fpng_exe = get_fpng_path();
+
     // Build command
     std::string cmd;
     if (tool == "fpng") {
-        cmd = "./build/bin/fpng -s -v " + input + " " + output + " 2>&1";
+        cmd = "\"" + fpng_exe + "\" -s -v \"" + input + "\" \"" + output + "\" 2>&1";
     } else if (tool == "optipng") {
-        cmd = "optipng -o7 -out " + output + " " + input + " 2>/dev/null";
+        cmd = "optipng -o7 -out \"" + output + "\" \"" + input + "\" 2> " + dev_null;
     } else if (tool == "oxipng") {
-        cmd = "oxipng -o6 --out " + output + " " + input + " 2>/dev/null";
+        cmd = "oxipng -o6 --out \"" + output + "\" \"" + input + "\" 2> " + dev_null;
     } else if (tool == "zopflipng") {
-        cmd = "zopflipng --iterations=15 " + input + " " + output + " 2>/dev/null";
+        cmd = "zopflipng --iterations=15 \"" + input + "\" \"" + output + "\" 2> " + dev_null;
     } else if (tool == "advpng") {
         // advpng modifies in-place
+#ifdef FPNG_OS_WINDOWS
+        std::system(("copy /Y \"" + input + "\" \"" + output + "\" > " + dev_null).c_str());
+#else
         std::string cp_cmd = "cp " + input + " " + output;
         std::system(cp_cmd.c_str());
-        cmd = "advpng -z4 " + output + " 2>/dev/null";
+#endif
+        cmd = "advpng -z4 \"" + output + "\" 2> " + dev_null;
     } else if (tool == "pngcrush") {
-        cmd = "pngcrush -brute " + input + " " + output + " 2>/dev/null";
+        cmd = "pngcrush -brute \"" + input + "\" \"" + output + "\" 2> " + dev_null;
     } else if (tool == "ect") {
+#ifdef FPNG_OS_WINDOWS
+        cmd = "ect -9 -strip \"" + input + "\" 2> " + dev_null + " && copy /Y \"" + input + "\" \"" + output + "\" > " + dev_null;
+#else
         cmd = "ect -9 -strip " + input + " 2>/dev/null && cp " + input + " " + output;
+#endif
     } else {
         r.success = false;
         return r;
     }
 
     fpng::Timer t;
+    // Wrap the command in quotes for std::system: on Windows, cmd.exe strips
+    // the outer quotes, so a command whose first token is a quoted path is
+    // otherwise misparsed (error 123).
+#ifdef FPNG_OS_WINDOWS
+    int ret = std::system(("\"" + cmd + "\"").c_str());
+#else
     int ret = std::system(cmd.c_str());
+#endif
     r.time_seconds = t.elapsed_seconds();
 
     if (ret == 0 && fs::exists(output)) {
@@ -155,14 +240,14 @@ int main(int argc, char** argv) {
     if (command_exists("ect")) { tools.push_back("ect"); std::cout << ", ect"; }
     std::cout << "\n\n";
 
-    if (tools.size() <= 1) {
-        std::cout << "No external compression tools found.\n";
+    if (tools.empty()) {
+        std::cout << "No compression tools found.\n";
         std::cout << "Install: apt install optipng oxipng zopflipng advancecomp pngcrush\n";
         return 0;
     }
 
     // Generate test images
-    fs::create_directories("/tmp/fpng_bench");
+    fs::create_directories(bench_dir());
     std::vector<std::string> images;
 
     // Generate test images of various sizes and patterns
@@ -178,7 +263,7 @@ int main(int argc, char** argv) {
 
     for (auto& s : specs) {
         auto data = make_test_image(s.w, s.h, s.pattern);
-        std::string path = "/tmp/fpng_bench/" + std::string(s.name) + ".png";
+        std::string path = (bench_dir() / (std::string(s.name) + ".png")).string();
         fpng::write_file(path, data);
         images.push_back(path);
         std::cout << "Generated: " << s.name << " (" << data.size() << " bytes)\n";
@@ -202,9 +287,9 @@ int main(int argc, char** argv) {
         br.original_size = fs::file_size(img_path);
 
         for (auto& tool : tools) {
-            std::string out_path = "/tmp/fpng_bench/out_" +
-                                    fs::path(img_path).filename().stem().string() +
-                                    "_" + tool + ".png";
+            std::string out_path = (bench_dir() /
+                                    (fs::path(img_path).filename().stem().string() +
+                                     "_" + tool + ".png")).string();
 
             auto tr = run_tool(tool, img_path, out_path);
             tr.original_size = br.original_size;

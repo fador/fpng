@@ -19,7 +19,15 @@ void MatchFinder::init(const uint8_t* data, size_t size) {
         sorted_.push_back({tag, static_cast<int32_t>(i)});
     }
     std::sort(sorted_.begin(), sorted_.end(),
-              [](const TagEntry& a, const TagEntry& b) { return a.tag < b.tag; });
+              [](const TagEntry& a, const TagEntry& b) {
+                  if (a.tag != b.tag) return a.tag < b.tag;
+                  // Within an equal-tag group, order by descending position so
+                  // that the forward scan visits the nearest (most recent)
+                  // candidates first. This makes the chain_depth budget and
+                  // the nice_len early-exit focus on matches that cost fewer
+                  // distance bits.
+                  return a.pos > b.pos;
+              });
 
     // Build quick-lookup index: first_[tag >> 16] = first occurrence in sorted_
     first_.assign(INDEX_SIZE + 1, -1);

@@ -5,6 +5,7 @@
 #include "compress/deflate/deflater.hpp"
 #include "png/reader.hpp"
 #include "png/writer.hpp"
+#include "compress/compressor.hpp"
 
 #include <cstring>
 #include <vector>
@@ -126,5 +127,65 @@ void test_roundtrip() {
         ok = (img3.pixels.size() == img.pixels.size() &&
               std::memcmp(img3.pixels.data(), img.pixels.data(), img.pixels.size()) == 0);
         run_test("PNG interlaced roundtrip - pixel data match", ok);
+    }
+}
+
+void test_full_compress_pipeline() {
+    std::cout << "Full Compress Pipeline Tests:\n";
+
+    // A graphic-like image with flat color regions (good LZ77/Huffman targets).
+    Image img;
+    img.width = 32;
+    img.height = 24;
+    img.bit_depth = 8;
+    img.color_type = 6;
+    img.interlaced = false;
+
+    size_t row_size = img.raw_scanline_size();
+    img.pixels.resize(row_size * img.height);
+    for (size_t y = 0; y < img.height; ++y) {
+        for (size_t x = 0; x < img.width; ++x) {
+            size_t off = y * row_size + x * 4;
+            img.pixels[off + 0] = static_cast<uint8_t>((x / 8) * 64);
+            img.pixels[off + 1] = static_cast<uint8_t>((y / 8) * 85);
+            img.pixels[off + 2] = static_cast<uint8_t>((x + y) % 3 == 0 ? 255 : 0);
+            img.pixels[off + 3] = 255;
+        }
+    }
+
+    CompressOptions copts;
+    copts.level = 5;
+    copts.multi_strategy = true;
+    copts.num_threads = 2;
+
+    CompressResult res = compress(img, copts);
+    bool ok = !res.data.empty();
+    run_test("compress() produces output", ok);
+
+    if (ok) {
+        PNGReader reader;
+        auto result = reader.read(res.data);
+        ok = result.has_value();
+        run_test("compress() output parses", ok);
+
+        if (ok) {
+            // The compressor may losslessly reduce format (e.g. RGBA->RGB when
+            // alpha is fully opaque), so compare the visual RGB content rather
+            // than raw buffer layout.
+            auto& img2 = *result;
+            ok = (img2.width == img.width && img2.height == img.height);
+            if (ok) {
+                for (size_t y = 0; y < img.height && ok; ++y) {
+                    for (size_t x = 0; x < img.width; ++x) {
+                        size_t src = y * row_size + x * 4;
+                        size_t dst = y * img2.raw_scanline_size() + x * img2.bytes_per_pixel();
+                        for (int c = 0; c < 3; ++c) {
+                            if (img2.pixels[dst + c] != img.pixels[src + c]) { ok = false; break; }
+                        }
+                    }
+                }
+            }
+            run_test("compress() visual content matches", ok);
+        }
     }
 }

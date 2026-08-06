@@ -17,6 +17,7 @@ inline void run_test(const std::string& name, bool result) {
         tests_failed++;
         std::cout << "  [FAIL] " << name << "\n";
     }
+    std::cout.flush();
 }
 
 int summary();
