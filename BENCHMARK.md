@@ -100,20 +100,21 @@ fpng's re-compression matches or improves on the original encoder in most cases.
 - **4-byte hash + deeper chains**: Upgraded `hash3()` → `hash4()` (4 bytes → 16-bit hash) with shifted sub-slot using bytes 1-3. Chain depths scaled to 128/1024/4096/8192 for Fast/Default/Best/Ultra. 16 sub-slots. Combined, these give ~16× better hash collision discrimination than the original single-level hash3.
 - **3-iteration DP refinement for large images**: Bumped `max_iterations` from 2 to 3 for large images to give the iterative DP↔entropy feedback loop one more round to converge.
 
-### Measured Improvement (Optimal Huffman + Match Ordering)
+### Measured Improvement (Optimal Huffman + Match Ordering + Proxy)
 
 Replacements that improved compression on the standard corpus (223 images: PNGSuite + photographic + synthetic, `fpng -o9 -j2`):
 
 - **Optimal length-limited Huffman**: Replaced the ad-hoc one-bit-at-a-time length limiter with a dynamic-programming solver equivalent to Package-Merge (Larmore–Hirschberg). It is provably optimal subject to the 15-bit DEFLATE limit and is verified exhaustively against a brute-force solver in the test suite. The fast, already-optimal plain-Huffman path is unchanged for the common case.
 - **Nearest-first match scanning**: Equal 4-byte-tag candidates are now ordered by descending position, so `chain_depth` and the `nice_len` early-exit focus on the most recent (fewer distance bits) matches first.
+- **Dynamic-Huffman proxy ranking**: The multi-strategy proxy now ranks candidates with dynamic Huffman instead of fixed Huffman, so its ranking matches the actual re-compress stage instead of systematically underrating dynamic-Huffman strategies. Negligible speed cost (parallel re-compress dominates).
 
 | Corpus (223 images, `-o9 -j2`) | Old (HEAD) | New | Δ |
 |-------------------------------|-----------|-----|---|
-| Total output size | 146,134 B | 142,809 B | **−3,325 B (−2.3%)** |
-| Compression ratio (out/in) | 17.43% | 17.03% | −0.40 pp |
-| Files improved | 132 | 144 | +12 |
+| Total output size | 146,134 B | 142,453 B | **−3,681 B (−2.5%)** |
+| Compression ratio (out/in) | 17.43% | 16.99% | −0.44 pp |
+| Files improved | 132 | 149 | +17 |
 
-Net effect: 86 files shrunk (3,478 B saved) against 18 minor regressions (153 B, largest 48 B). The regressions stem from the heuristic greedy/lazy LZ77 parser interacting with the new match order, and are dwarfed by the gains. All 29 unit tests pass, including exhaustive Huffman-optimality checks.
+Net effect: the Huffman + match-order changes shrink 86 files (3,478 B saved) against 18 minor regressions (153 B, largest 48 B); the proxy change adds a further 22 improved / 13 regressed (net +359 B). Remaining regressions stem from the heuristic greedy/lazy LZ77 parser interacting with the new match order, and are dwarfed by the gains. All 29 unit tests pass, including exhaustive Huffman-optimality checks.
 
 ## Running Your Own Benchmarks
 

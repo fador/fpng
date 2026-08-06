@@ -312,12 +312,17 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         }
 
         DeflateOptions dopts;
-        dopts.level = CompressionLevel::Default; // better proxy fidelity than Fast
+        // Use dynamic Huffman (Best) for the proxy so its ranking matches the
+        // actual re-compress stage. A fixed-Huffman proxy systematically
+        // underrates strategies that compress well only under dynamic Huffman,
+        // pruning them before the re-compress pass. One greedy iteration keeps
+        // the proxy cheap.
+        dopts.level = CompressionLevel::Best;
         dopts.iterations = 1;
         dopts.optimal_parsing = false;
         dopts.adaptive_blocks = !is_huge; // adaptive for all but huge images
         dopts.chain_depth = 0; // auto-select based on level
-        dopts.max_block_size = 65536; // large blocks for proxy (no tree overhead with Fixed)
+        dopts.max_block_size = 65536; // large blocks for proxy
 
         TrialResult tr;
         tr.data = zlib_compress(filtered_data, dopts);
