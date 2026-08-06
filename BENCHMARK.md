@@ -116,6 +116,22 @@ Replacements that improved compression on the standard corpus (223 images: PNGSu
 
 Net effect: the Huffman + match-order changes shrink 86 files (3,478 B saved) against 18 minor regressions (153 B, largest 48 B); the proxy change adds a further 22 improved / 13 regressed (net +359 B). Remaining regressions stem from the heuristic greedy/lazy LZ77 parser interacting with the new match order, and are dwarfed by the gains. All 29 unit tests pass, including exhaustive Huffman-optimality checks.
 
+### Speed Optimizations (no compression change)
+
+Pure-encoding-speed improvements verified to produce byte-identical output:
+
+- **Fixed-point entropy costs**: Replaced the per-symbol `std::log`/`std::ceil` in `compute_entropy_costs` with a Q16 squaring-based integer `log2` (no floating point). Accurate to ~1.5e-5 log2 units, so cost decisions are unchanged.
+- **`parse_optimal` buffer reuse**: The DP workspace (`cost`, `prev_match_len`, `prev_match_dist`, `is_literal`, `matches`) is now held in the parser and reused across Huffman-refinement iterations instead of being reallocated each pass.
+- **GA / hill-climb fitness table**: Per-row MinSum for all 5 filters is precomputed once; a fitness evaluation is then an O(height) table lookup instead of re-filtering the whole image each generation.
+- **Dead code removal**: Removed the unused `split_adaptive` (and its `estimate_block_cost` helper) and the unused `MatchFinder` cost-model fields.
+
+| Corpus (223 images, `-o9 -j2`) | Before | After | Δ |
+|-------------------------------|--------|-------|---|
+| Total compression time | 819.2 s | 782.8 s | **−4.4%** |
+| Total output size | 142,450 B | 142,455 B | +5 B (noise) |
+
+The GA fitness table gives the largest gains on large (level ≥ 7) images; the corpus is mostly small images, so the aggregate speedup understates the per-image impact.
+
 ## Running Your Own Benchmarks
 
 ```bash

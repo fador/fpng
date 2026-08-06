@@ -31,10 +31,6 @@ public:
     size_t chain_depth = 128; // max matches to examine per position
     int nice_len = 32;
     int row_stride = 0;
-    // Cost model fields for accurate scoring (populated from LZ77Parser::CostModel)
-    const uint16_t* precomputed_costs = nullptr;
-    const uint8_t* litlen_lengths = nullptr;
-    const uint8_t* dist_lengths = nullptr;
 
 private:
     static constexpr size_t INDEX_BITS = 16;
@@ -111,6 +107,17 @@ private:
                                      const Options& opts);
     std::vector<Token> parse_optimal(const uint8_t* data, size_t size,
                                       const Options& opts);
+
+    // Reusable DP workspace, persisted across parse() calls so the iterative
+    // Huffman-refinement loop does not reallocate these buffers each pass.
+    struct Workspace {
+        std::vector<uint64_t> cost;
+        std::vector<int> prev_match_len;
+        std::vector<int> prev_match_dist;
+        std::vector<bool> is_literal;
+        std::vector<LZMatch> matches;
+    };
+    Workspace ws_;
 };
 
 } // namespace fpng

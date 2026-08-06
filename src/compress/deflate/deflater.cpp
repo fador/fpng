@@ -13,6 +13,34 @@ namespace fpng {
 
 namespace {
 
+// floor(log2(x)) for x >= 1.
+static int ilog2_floor(uint64_t x) {
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_ARM64)
+    unsigned long idx = 0;
+    _BitScanReverse64(&idx, x);
+    return static_cast<int>(idx);
+#else
+    return 63 - __builtin_clzll(x);
+#endif
+}
+
+// log2(x) in Q16 fixed point (16 fractional bits), for x >= 1, x <= 2^64.
+// Uses a Q31 mantissa with the squaring / bit-extraction method; no float math.
+static uint32_t log2_fixed(uint64_t x) {
+    int exp = ilog2_floor(x);
+    // mantissa m = x / 2^exp in [1,2), represented as Q31 (value = m/2^31).
+    uint64_t m = (exp <= 31) ? (x << (31 - exp)) : (x >> (exp - 31));
+    // m is in [2^31, 2^32).
+    uint32_t frac = 0;
+    uint64_t cur = m;
+    for (int i = 0; i < 16; ++i) {
+        cur = (cur * cur) >> 31; // Q31
+        frac <<= 1;
+        if (cur >= (1ULL << 32)) { cur >>= 1; frac |= 1; }
+    }
+    return (static_cast<uint32_t>(exp) << 16) | frac;
+}
+
 // Compute entropy-based costs from symbol frequencies.
 // Returns a 288+32 entry vector of scaled fixed-point costs (scale=1024).
 // cost[sym] = ceil(-log2(freq[sym] / total) * 1024)
@@ -27,25 +55,29 @@ std::vector<uint16_t> compute_entropy_costs(
     uint64_t ll_total = 0;
     for (int i = 0; i < 288; ++i) ll_total += ll_freq[i];
     if (ll_total == 0) ll_total = 1;
+    uint32_t ll_total_log = log2_fixed(ll_total);
 
     // Compute total distance frequency, seeding unused codes with freq=1
     uint64_t d_total = 0;
-    int d_added = 0;
     for (int i = 0; i < 32; ++i) {
         if (d_freq[i] > 0) d_total += d_freq[i];
-        else { d_total += 1; d_added++; }
+        else d_total += 1;
     }
     if (d_total == 0) d_total = 1;
+    uint32_t d_total_log = log2_fixed(d_total);
 
-    constexpr int SCALE = 1024;
-    const double log2e = 1.4426950408889634; // 1/ln(2)
+    // cost = ceil((log2(total) - log2(freq)) * 1024). The Q16 log yields
+    // (diff * 1024) = diff * 2^10; dividing by 2^6 gives diff * 1024 / 2^16.
+    auto entropy_cost = [](uint64_t total_log, uint64_t freq) -> uint16_t {
+        uint32_t diff = static_cast<uint32_t>(total_log) - log2_fixed(freq);
+        uint32_t c = (diff + 63) >> 6; // ceil(diff / 64)
+        if (c == 0) c = 1;             // minimum 1/1024 bit
+        return c > 65535 ? 65535 : static_cast<uint16_t>(c);
+    };
 
     for (int i = 0; i < 288; ++i) {
         if (ll_freq[i] > 0) {
-            double p = static_cast<double>(ll_freq[i]) / ll_total;
-            double bits = -std::log(p) * log2e;
-            costs[i] = static_cast<uint16_t>(std::ceil(bits * SCALE));
-            if (costs[i] == 0) costs[i] = 1; // minimum 1/1024 bit
+            costs[i] = entropy_cost(ll_total_log, ll_freq[i]);
         } else {
             costs[i] = 65535; // literal/length: keep frozen (256 literal values, most appear)
         }
@@ -54,10 +86,7 @@ std::vector<uint16_t> compute_entropy_costs(
     for (int i = 0; i < 32; ++i) {
         int idx = 288 + i;
         uint32_t freq = d_freq[i] > 0 ? d_freq[i] : 1; // seed unused with 1
-        double p = static_cast<double>(freq) / d_total;
-        double bits = -std::log(p) * log2e;
-        costs[idx] = static_cast<uint16_t>(std::ceil(bits * SCALE));
-        if (costs[idx] == 0) costs[idx] = 1;
+        costs[idx] = entropy_cost(d_total_log, freq);
     }
 
     return costs;

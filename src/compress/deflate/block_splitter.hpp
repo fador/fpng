@@ -23,13 +23,7 @@ public:
         const uint8_t* data, size_t size,
         size_t max_block_size = 8192);
 
-    // Adaptive block splitting based on frequency changes (DP-based, slower)
-    static std::vector<BlockSplit> split_adaptive(
-        const uint8_t* data, size_t size,
-        size_t min_block = 2048,
-        size_t max_block = 8192);
-
-    // Greedy entropy-based adaptive splitting (fast O(n))
+    // Adaptive block splitting based on frequency changes (greedy, O(n))
     static std::vector<BlockSplit> split_greedy_adaptive(
         const uint8_t* data, size_t size,
         size_t min_block = 2048,

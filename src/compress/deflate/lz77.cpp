@@ -295,10 +295,15 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
     const uint8_t* data, size_t size, const Options& opts) {
 
     constexpr uint64_t INF = std::numeric_limits<uint64_t>::max();
-    std::vector<uint64_t> cost(size + 1, INF);
-    std::vector<int> prev_match_len(size + 1, 0);
-    std::vector<int> prev_match_dist(size + 1, 0);
-    std::vector<bool> is_literal(size + 1, false);
+    // Reuse buffers across iterations (they only grow).
+    auto& cost = ws_.cost;
+    auto& prev_match_len = ws_.prev_match_len;
+    auto& prev_match_dist = ws_.prev_match_dist;
+    auto& is_literal = ws_.is_literal;
+    cost.assign(size + 1, INF);
+    prev_match_len.assign(size + 1, 0);
+    prev_match_dist.assign(size + 1, 0);
+    is_literal.assign(size + 1, false);
     cost[0] = 0;
 
 
@@ -310,7 +315,7 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
     mf.row_stride = opts.row_stride;
     mf.init(data, size);
 
-    std::vector<LZMatch> matches;
+    auto& matches = ws_.matches;
     matches.reserve(128);
 
     for (size_t i = 0; i < size; ++i) {

@@ -183,21 +183,35 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
             // Byte entropy alone is a poor proxy — it can prefer filter None
             // for gradient images even when Paeth-produced residuals compress
             // much better with LZ77.
-            auto fitness = [&](const std::vector<FilterType>& filters) -> size_t {
-                std::vector<uint8_t> prev(raw_ss, 0);
-                uint64_t min_sum = 0;
+            //
+            // Because each row's filtered output depends only on the source rows
+            // (not on other rows' chosen filter types), the per-row MinSum for
+            // all 5 filters is precomputed once; a fitness evaluation is then
+            // just a table lookup (O(height)) instead of re-filtering the whole
+            // image (O(height*width)).
+            std::vector<std::array<uint64_t, 5>> row_min_sum(height);
+            {
+                std::vector<uint8_t> prev_src(raw_ss, 0);
+                std::vector<uint8_t> row(raw_ss + 1);
                 for (size_t y = 0; y < height; ++y) {
                     const uint8_t* src = img.pixels.data() + y * raw_ss;
-                    std::vector<uint8_t> row(raw_ss + 1);
-                    FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
-                    filter_scanline(ft, src, row.data(), bpp, raw_ss,
-                                     y > 0 ? prev.data() : nullptr);
-                    for (size_t b = 1; b <= raw_ss; ++b)
-                        min_sum += row[b];
-                    std::memcpy(prev.data(), src, raw_ss);
+                    for (int ft = 0; ft < 5; ++ft) {
+                        filter_scanline(static_cast<FilterType>(ft), src, row.data(),
+                                        bpp, raw_ss, y > 0 ? prev_src.data() : nullptr);
+                        uint64_t s = 0;
+                        for (size_t b = 1; b <= raw_ss; ++b) s += row[b];
+                        row_min_sum[y][ft] = s;
+                    }
+                    std::memcpy(prev_src.data(), src, raw_ss);
                 }
+            }
+            auto fitness = [&](const std::vector<FilterType>& filters) -> size_t {
+                uint64_t min_sum = 0;
+                size_t nrows = std::min(filters.size(), height);
+                for (size_t y = 0; y < nrows; ++y)
+                    min_sum += row_min_sum[y][static_cast<int>(filters[y])];
                 int switches = 0;
-                for (size_t y = 1; y < filters.size(); ++y)
+                for (size_t y = 1; y < nrows; ++y)
                     if (filters[y] != filters[y-1]) ++switches;
                 return static_cast<size_t>(min_sum) + static_cast<size_t>(switches) * 1000;
             };
@@ -327,19 +341,28 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
             std::vector<FilterType> best_filters;
             size_t best_size = std::numeric_limits<size_t>::max();
 
-            auto fitness_hc = [&](const std::vector<FilterType>& filters) -> size_t {
-                std::vector<uint8_t> prev(raw_ss, 0);
-                uint64_t min_sum = 0;
+            // Precompute per-row MinSum for all 5 filters (see GA note above).
+            std::vector<std::array<uint64_t, 5>> hc_row_min_sum(height);
+            {
+                std::vector<uint8_t> prev_src(raw_ss, 0);
+                std::vector<uint8_t> row(raw_ss + 1);
                 for (size_t y = 0; y < height; ++y) {
                     const uint8_t* src = img.pixels.data() + y * raw_ss;
-                    std::vector<uint8_t> row(raw_ss + 1);
-                    FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
-                    filter_scanline(ft, src, row.data(), bpp, raw_ss,
-                                     y > 0 ? prev.data() : nullptr);
-                    for (size_t b = 1; b <= raw_ss; ++b)
-                        min_sum += row[b];
-                    std::memcpy(prev.data(), src, raw_ss);
+                    for (int ft = 0; ft < 5; ++ft) {
+                        filter_scanline(static_cast<FilterType>(ft), src, row.data(),
+                                        bpp, raw_ss, y > 0 ? prev_src.data() : nullptr);
+                        uint64_t s = 0;
+                        for (size_t b = 1; b <= raw_ss; ++b) s += row[b];
+                        hc_row_min_sum[y][ft] = s;
+                    }
+                    std::memcpy(prev_src.data(), src, raw_ss);
                 }
+            }
+            auto fitness_hc = [&](const std::vector<FilterType>& filters) -> size_t {
+                uint64_t min_sum = 0;
+                size_t nrows = std::min(filters.size(), height);
+                for (size_t y = 0; y < nrows; ++y)
+                    min_sum += hc_row_min_sum[y][static_cast<int>(filters[y])];
                 return static_cast<size_t>(min_sum);
             };
 
