@@ -455,7 +455,7 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
     // Never exceed 65535 so every block remains eligible for a stored block.
     size_t eff_block_size = opts.max_block_size;
     if (eff_block_size == 0) {
-        eff_block_size = (data.size() >= 131072) ? 8192 : 65536;
+        eff_block_size = 65535;
     }
     eff_block_size = std::min(eff_block_size, size_t(65535));
     auto blocks = opts.adaptive_blocks
