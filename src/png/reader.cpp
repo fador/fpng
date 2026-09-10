@@ -339,9 +339,7 @@ bool PNGReader::decompress_image(const std::vector<uint8_t>& compressed_data, Im
             auto& p = adam7_passes[pass];
             if (p.width == 0 || p.height == 0) continue;
 
-            size_t pass_stride = (img.color_type == 3)
-                ? ((static_cast<size_t>(p.width) * img.bit_depth + 7) / 8)
-                : (static_cast<size_t>(p.width) * bpp);
+            size_t pass_stride = img.scanline_size_for_width(p.width);
 
             std::vector<uint8_t> prev_scanline(pass_stride, 0);
 
@@ -374,8 +372,8 @@ bool PNGReader::decompress_image(const std::vector<uint8_t>& compressed_data, Im
                         uint32_t img_x = p.x0 + x * p.dx;
                         if (img_x >= img.width) continue;
 
-                        if (img.color_type == 3) {
-                            // Bit-packed indexed
+                        if (img.bit_depth < 8) {
+                            // Bit-packed (indexed or grayscale) interlace scatter
                             size_t src_byte = static_cast<size_t>(x) * img.bit_depth / 8;
                             size_t dst_byte = static_cast<size_t>(img_x) * img.bit_depth / 8;
                             int src_bit = static_cast<int>((x * img.bit_depth) % 8);
@@ -444,9 +442,7 @@ bool PNGReader::decompress_frame(const std::vector<uint8_t>& compressed_data,
 
     size_t bpp = img.bytes_per_pixel();
     size_t stride = bpp;
-    size_t row_size = (img.color_type == 3)
-        ? ((static_cast<size_t>(finfo.width) * img.bit_depth + 7) / 8)
-        : (static_cast<size_t>(finfo.width) * bpp);
+    size_t row_size = img.scanline_size_for_width(finfo.width);
 
     // Note: APNG frames are never interlaced
     size_t offset = 0;

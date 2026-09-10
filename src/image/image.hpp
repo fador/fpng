@@ -59,6 +59,9 @@ struct Image {
     bool valid() const noexcept;
     size_t pixel_count() const noexcept { return static_cast<size_t>(width) * height; }
     size_t raw_scanline_size() const noexcept;
+    // Byte width of one scanline of `w` pixels, honoring bit-packed formats
+    // (indexed and grayscale when bit_depth < 8).
+    size_t scanline_size_for_width(uint32_t w) const noexcept;
     size_t bytes_per_pixel() const noexcept;
     size_t total_raw_size() const noexcept;
 };
@@ -79,11 +82,15 @@ inline bool Image::valid() const noexcept {
 }
 
 inline size_t Image::raw_scanline_size() const noexcept {
+    return scanline_size_for_width(width);
+}
+
+inline size_t Image::scanline_size_for_width(uint32_t w) const noexcept {
     if (color_type == 3) {
-        return (static_cast<size_t>(width) * bit_depth + 7) / 8;
+        return (static_cast<size_t>(w) * bit_depth + 7) / 8;
     }
     size_t ch = (color_type == 0 ? 1 : (color_type == 2 ? 3 : (color_type == 4 ? 2 : 4)));
-    return (static_cast<size_t>(width) * ch * bit_depth + 7) / 8;
+    return (static_cast<size_t>(w) * ch * bit_depth + 7) / 8;
 }
 
 inline size_t Image::bytes_per_pixel() const noexcept {

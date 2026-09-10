@@ -6,6 +6,7 @@
 #include "preprocess/preprocessor.hpp"
 #include "preprocess/alpha_optimizer.hpp"
 #include "preprocess/palette_sorter.hpp"
+#include "preprocess/color_reducer.hpp"
 #include "preprocess/content_analyzer.hpp"
 #include "util/timer.hpp"
 
@@ -66,10 +67,6 @@ std::vector<Strategy> get_strategies(int level) {
     strategies.push_back({7, CompressionLevel::Best, 2, true, false, "max-13"});
     strategies.push_back({7, CompressionLevel::Ultra, 3, true, false, "max-14"});
 
-    // BT match finder variants (exhaustive matching)
-    strategies.push_back({2, CompressionLevel::Best, 2, true, false, "max-15"});
-    strategies.push_back({3, CompressionLevel::Ultra, 3, true, false, "max-16"});
-
     // Zopfli-style: multi-iteration refinement (4-5 passes)
     // Each pass rebuilds Huffman and re-parses with refined costs
     strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, "max-17"});
@@ -77,12 +74,14 @@ std::vector<Strategy> get_strategies(int level) {
     strategies.push_back({2, CompressionLevel::Ultra, 5, true, false, "max-19"});
     strategies.push_back({3, CompressionLevel::Ultra, 5, true, false, "max-20"});
 
-    // Combined: BT match finder + high iterations + high filter
-    strategies.push_back({2, CompressionLevel::Ultra, 4, true, false, "max-21"});
-    strategies.push_back({3, CompressionLevel::Ultra, 5, true, false, "max-22"});
-
-    // Pure quality: GA filter + BT match + max iterations
+    // Pure quality: GA filter + max iterations
     strategies.push_back({7, CompressionLevel::Ultra, 5, true, false, "max-23"});
+
+    // Color-reduction variants: RGB->gray, truecolor->indexed, 16->8 bit.
+    // These change the output color type, so they must be compared by size.
+    strategies.push_back({2, CompressionLevel::Best, 2, true, false, "max-24", true});
+    strategies.push_back({3, CompressionLevel::Best, 2, true, true, "max-25", true});
+    strategies.push_back({7, CompressionLevel::Ultra, 3, true, false, "max-26", true});
 
     return strategies;
 }
@@ -93,6 +92,9 @@ std::vector<uint8_t> run_strategy(const Image& img, const Strategy& s) {
     // Pre-processing
     if (s.alpha_zero) {
         alpha_optimize(work);
+    }
+    if (s.color_reduce) {
+        reduce_colors(work);
     }
     if (s.palette_sort) {
         sort_palette(work);
@@ -127,8 +129,8 @@ std::vector<uint8_t> run_strategy(const Image& img, const Strategy& s) {
     DeflateOptions dopts;
     dopts.level = s.deflate_level;
     dopts.iterations = s.deflate_iterations;
-    dopts.optimal_parsing = (s.deflate_iterations > 1);
     dopts.adaptive_blocks = false;
+    dopts.row_stride = static_cast<int>(raw_ss + 1);
 
     return zlib_compress(filtered, dopts);
 }
@@ -145,6 +147,7 @@ CompressResult compress_single(const Image& img, const CompressOptions& opts) {
 
     // Re-apply strategy-specific pre-processing
     if (s.alpha_zero) alpha_optimize(work);
+    if (s.color_reduce) reduce_colors(work);
     if (s.palette_sort) sort_palette(work);
 
     FilterOptions fopts;
@@ -155,7 +158,6 @@ CompressResult compress_single(const Image& img, const CompressOptions& opts) {
     DeflateOptions dopts;
     dopts.level = s.deflate_level;
     dopts.iterations = s.deflate_iterations;
-    dopts.optimal_parsing = (s.deflate_iterations > 1);
 
     WriteOptions wopts;
     wopts.filters = filters;
@@ -277,6 +279,8 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         Image work = img;
         if (s.alpha_zero && (img.color_type == 6 || img.color_type == 4))
             alpha_optimize(work);
+        if (s.color_reduce)
+            reduce_colors(work);
         if (s.palette_sort)
             sort_palette(work);
 
@@ -319,15 +323,17 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         // the proxy cheap.
         dopts.level = CompressionLevel::Best;
         dopts.iterations = 1;
-        dopts.optimal_parsing = false;
         dopts.adaptive_blocks = !is_huge; // adaptive for all but huge images
         dopts.chain_depth = 0; // auto-select based on level
         dopts.max_block_size = 65536; // large blocks for proxy
+        dopts.row_stride = static_cast<int>(raw_ss + 1);
 
         TrialResult tr;
         tr.data = zlib_compress(filtered_data, dopts);
         tr.strategy = s;
-        tr.size = tr.data.size();
+        // Account for color-type overhead (PLTE/tRNS) so a reduced candidate is
+        // compared on full-PNG terms, not just compressed pixel data.
+        tr.size = tr.data.size() + work.palette.size() + work.alpha_palette.size();
 
         // Update atomic best (smaller is better)
         size_t prev_best = best_atomic.load();
@@ -376,8 +382,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
         // For huge images, only re-compress the single best proxy to save time
         int recompress_count = is_huge ? 1 : (is_large ? 2 : 3);
-        // For medium images, also clamp at 2 to keep things snappy
-        if (!is_large && !is_huge) recompress_count = std::min(recompress_count, 2);
 
         // Force-include GA strategy in re-compress for large images
         // (its Fixed-Huffman proxy rank underrates it — Dynamic Huffman
@@ -402,6 +406,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
             Image work = img;
             if (strat.alpha_zero && (img.color_type == 6 || img.color_type == 4))
                 alpha_optimize(work);
+            if (strat.color_reduce) reduce_colors(work);
             if (strat.palette_sort) sort_palette(work);
 
             FilterOptions fopts;
@@ -430,7 +435,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                 // Bump to at least 3 iterations for Huffman cost feedback on iter 3
                 dopts.iterations = std::max(std::min(dopts.iterations, 3), 3);
             }
-            dopts.optimal_parsing = (dopts.iterations > 1);
             dopts.chain_depth = 0; // auto-select based on level
 
             WriteOptions wopts;
@@ -464,40 +468,44 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                     candidate.deflate_level != s1.deflate_level ||
                     candidate.deflate_iterations != s1.deflate_iterations ||
                     candidate.alpha_zero != s1.alpha_zero ||
-                    candidate.palette_sort != s1.palette_sort) {
+                    candidate.palette_sort != s1.palette_sort ||
+                    candidate.color_reduce != s1.color_reduce) {
                     s2 = candidate;
                     break;
                 }
             }
 
             // Generate hybrids: mix filter_level, deflate_level, iterations,
-            // alpha_zero, and palette_sort from the two parents.
-            // Each hybrid gets one parameter from s2, rest from s1.
-            struct Variant { int fl; CompressionLevel dl; int it; bool az; bool ps; };
+            // alpha_zero, palette_sort and color_reduce from the two parents.
+            struct Variant { int fl; CompressionLevel dl; int it; bool az; bool ps; bool cr; };
             std::vector<Variant> hybrids;
 
             // Only vary parameters that actually differ
             if (s2.filter_level != s1.filter_level) {
                 hybrids.push_back({s2.filter_level, s1.deflate_level, s1.deflate_iterations,
-                                   s1.alpha_zero, s1.palette_sort});
+                                   s1.alpha_zero, s1.palette_sort, s1.color_reduce});
             }
             if (s2.deflate_level != s1.deflate_level) {
                 hybrids.push_back({s1.filter_level, s2.deflate_level, s1.deflate_iterations,
-                                   s1.alpha_zero, s1.palette_sort});
+                                   s1.alpha_zero, s1.palette_sort, s1.color_reduce});
             }
             if (s2.deflate_iterations != s1.deflate_iterations) {
                 hybrids.push_back({s1.filter_level, s1.deflate_level, s2.deflate_iterations,
-                                   s1.alpha_zero, s1.palette_sort});
+                                   s1.alpha_zero, s1.palette_sort, s1.color_reduce});
             }
             // Vary alpha_zero only if image actually has alpha
             if (s2.alpha_zero != s1.alpha_zero &&
                 (img.color_type == 6 || img.color_type == 4)) {
                 hybrids.push_back({s1.filter_level, s1.deflate_level, s1.deflate_iterations,
-                                   s2.alpha_zero, s1.palette_sort});
+                                   s2.alpha_zero, s1.palette_sort, s1.color_reduce});
             }
             if (s2.palette_sort != s1.palette_sort) {
                 hybrids.push_back({s1.filter_level, s1.deflate_level, s1.deflate_iterations,
-                                   s1.alpha_zero, s2.palette_sort});
+                                   s1.alpha_zero, s2.palette_sort, s1.color_reduce});
+            }
+            if (s2.color_reduce != s1.color_reduce) {
+                hybrids.push_back({s1.filter_level, s1.deflate_level, s1.deflate_iterations,
+                                   s1.alpha_zero, s1.palette_sort, s2.color_reduce});
             }
 
             // Try each hybrid (skip if identical to an already-tested strategy)
@@ -505,10 +513,10 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                 // Skip if same as s1 or s2 (already tested)
                 if (h.fl == s1.filter_level && h.dl == s1.deflate_level &&
                     h.it == s1.deflate_iterations && h.az == s1.alpha_zero &&
-                    h.ps == s1.palette_sort) continue;
+                    h.ps == s1.palette_sort && h.cr == s1.color_reduce) continue;
                 if (h.fl == s2.filter_level && h.dl == s2.deflate_level &&
                     h.it == s2.deflate_iterations && h.az == s2.alpha_zero &&
-                    h.ps == s2.palette_sort) continue;
+                    h.ps == s2.palette_sort && h.cr == s2.color_reduce) continue;
 
                 // Allow up to 2 parameter changes (not just 1)
                 int changes = 0;
@@ -517,11 +525,13 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                 if (h.it != s1.deflate_iterations) ++changes;
                 if (h.az != s1.alpha_zero) ++changes;
                 if (h.ps != s1.palette_sort) ++changes;
+                if (h.cr != s1.color_reduce) ++changes;
                 if (changes > 2) continue;
 
                 Image work = img;
                 if (h.az && (img.color_type == 6 || img.color_type == 4))
                     alpha_optimize(work);
+                if (h.cr) reduce_colors(work);
                 if (h.ps) sort_palette(work);
 
                 FilterOptions fopts;
@@ -534,7 +544,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                 DeflateOptions d;
                 d.level = h.dl;
                 d.iterations = is_huge ? 1 : h.it;
-                d.optimal_parsing = (d.iterations > 1);
                 d.adaptive_blocks = !is_huge && !is_large;
                 d.chain_depth = 0;
 
@@ -587,6 +596,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                     Image work = img;
                     if (use_alpha && (img.color_type == 6 || img.color_type == 4))
                         alpha_optimize(work);
+                    if (ref.color_reduce) reduce_colors(work);
                     if (ref.palette_sort) sort_palette(work);
 
                 std::vector<FilterType> uniforms(work.height, ft);
@@ -595,7 +605,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                 d.level = ref.deflate_level;
                 d.iterations = is_huge ? 1 :
                     (is_large ? std::min(ref.deflate_iterations, 2) : ref.deflate_iterations);
-                d.optimal_parsing = (d.iterations > 1);
                 d.adaptive_blocks = !is_huge && !is_large;
                 d.chain_depth = 0;
 
@@ -635,7 +644,6 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
     wopts.filters = {}; // auto-compute
     wopts.deflate.level = best_strat.deflate_level;
     wopts.deflate.iterations = best_strat.deflate_iterations;
-    wopts.deflate.optimal_parsing = (best_strat.deflate_iterations > 1);
 
     // Need to re-filter since the writer auto-computes
     Image work2 = img;

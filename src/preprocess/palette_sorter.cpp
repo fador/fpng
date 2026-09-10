@@ -44,9 +44,32 @@ void sort_palette(Image& img) {
     if (!img.alpha_palette.empty())
         img.alpha_palette = std::move(new_alpha);
 
-    // Remap pixels
-    for (auto& p : img.pixels) {
-        if (p < perm.size()) p = perm[p];
+    // Remap pixels (packed bit depths store multiple indices per byte)
+    if (img.bit_depth >= 8) {
+        for (auto& p : img.pixels) {
+            if (p < perm.size()) p = perm[p];
+        }
+    } else {
+        int bd = img.bit_depth;
+        int per = 8 / bd;
+        uint8_t mask = static_cast<uint8_t>((1u << bd) - 1);
+        size_t row_bytes = img.raw_scanline_size();
+        for (size_t y = 0; y < img.height; ++y) {
+            uint8_t* row = img.pixels.data() + y * row_bytes;
+            for (size_t bx = 0; bx < row_bytes; ++bx) {
+                uint8_t byte = row[bx];
+                uint8_t outb = 0;
+                for (int k = 0; k < per; ++k) {
+                    size_t pixel = bx * static_cast<size_t>(per) + k;
+                    int shift = 8 - bd * (k + 1);
+                    uint8_t idx = static_cast<uint8_t>((byte >> shift) & mask);
+                    uint8_t mapped = (pixel < img.width && idx < perm.size())
+                                         ? perm[idx] : idx;
+                    outb = static_cast<uint8_t>(outb | (mapped << shift));
+                }
+                row[bx] = outb;
+            }
+        }
     }
 }
 

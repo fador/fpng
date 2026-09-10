@@ -42,10 +42,17 @@ double filter_cost(FilterType ft, const uint8_t* src, size_t byte_width,
     return byte_entropy(filtered.data() + 1, byte_width);
 }
 
-// Compress trial data and return size
+// Compress trial data with a fast (greedy + fixed Huffman) encoder and return
+// size. Previously this used CompressionLevel::Store, which returns the same
+// byte count for every candidate filter — making the brute-force filter search
+// a no-op that always selected None.
 size_t trial_compress_size(const std::vector<uint8_t>& data) {
     DeflateOptions dopts;
-    dopts.level = CompressionLevel::Store;
+    dopts.level = CompressionLevel::Fast;
+    dopts.iterations = 1;
+    dopts.adaptive_blocks = false;
+    dopts.chain_depth = 32;
+    dopts.max_block_size = 65535;
     return deflate_compress(data, dopts).size();
 }
 
@@ -149,7 +156,7 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
 
             // Guard: if population too small, fall back to MinSum heuristic
             if (POP < 5 || GENS < 1) {
-                std::vector<FilterType> result(height, FilterType::None);
+                std::vector<FilterType> fallback(height, FilterType::None);
                 std::vector<uint8_t> prev(raw_ss, 0);
                 for (size_t y = 0; y < height; ++y) {
                     const uint8_t* src = img.pixels.data() + y * raw_ss;
@@ -164,10 +171,10 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                         for (size_t b = 1; b <= raw_ss; ++b) cost += filtered[b];
                         if (cost < best_cost) { best_cost = cost; best = type; }
                     }
-                    result[y] = best;
+                    fallback[y] = best;
                     std::memcpy(prev.data(), src, raw_ss);
                 }
-                return result;
+                return fallback;
             }
 
             const int ELITE = std::max(1, POP / 10);

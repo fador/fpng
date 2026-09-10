@@ -70,6 +70,28 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
     }
     found = lo;
 
+    // Within the equal-tag group positions are ordered descending, so all
+    // entries with pos >= current pos precede the usable candidates. Binary
+    // search that boundary instead of linear-scanning past every future
+    // position (which made this O(N) per lookup / O(N^2) overall on a
+    // full-stream index).
+    {
+        int32_t a = found, b = static_cast<int32_t>(sorted_.size());
+        while (a < b) {
+            int32_t mid = a + (b - a) / 2;
+            if (sorted_[mid].tag <= tag) a = mid + 1;
+            else b = mid;
+        }
+        int32_t tag_end = a;
+        a = found; b = tag_end;
+        while (a < b) {
+            int32_t mid = a + (b - a) / 2;
+            if (sorted_[mid].pos >= static_cast<int32_t>(pos)) a = mid + 1;
+            else b = mid;
+        }
+        found = a;
+    }
+
     // Scan forward through all entries with matching tag
     size_t scanned = 0;
     while (found < static_cast<int32_t>(sorted_.size()) &&
@@ -146,8 +168,30 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
         else hi_end = mid;
     }
 
-    // Collect all matching positions
+    // Skip entries with pos >= current pos (see find_longest).
+    {
+        int32_t a = lo, b = static_cast<int32_t>(sorted_.size());
+        while (a < b) {
+            int32_t mid = a + (b - a) / 2;
+            if (sorted_[mid].tag <= tag) a = mid + 1;
+            else b = mid;
+        }
+        int32_t tag_end = a;
+        a = lo; b = tag_end;
+        while (a < b) {
+            int32_t mid = a + (b - a) / 2;
+            if (sorted_[mid].pos >= static_cast<int32_t>(pos)) a = mid + 1;
+            else b = mid;
+        }
+        lo = a;
+    }
+
+    // Collect all matching positions. Candidates are visited nearest-first
+    // (distance increasing), so keep only matches that set a new longest
+    // length. Shorter-but-farther matches are dominated and would only bloat
+    // the optimal-parser DP. This caps the returned list at ~MAX_MATCH_LEN.
     size_t scanned = 0;
+    size_t best_len = 0;
     while (lo < static_cast<int32_t>(sorted_.size()) &&
            sorted_[lo].tag == tag && scanned < chain_depth * 2) {
         size_t candidate = static_cast<size_t>(sorted_[lo].pos);
@@ -158,9 +202,11 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
 
         size_t match_len = simd::match_length(data_ + candidate + 4, cur + 4,
                                                max_match - 4) + 4;
-        if (match_len >= 4) {
+        if (match_len >= 4 && match_len > best_len) {
+            best_len = match_len;
             matches.push_back({static_cast<uint16_t>(match_len),
                                static_cast<uint16_t>(dist)});
+            if (match_len >= max_match) break;
         }
         ++scanned;
     }
@@ -174,67 +220,79 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse(
 
 std::vector<LZ77Parser::Token> LZ77Parser::parse(
     const uint8_t* data, size_t size, const Options& opts) {
+    return parse_range(data, size, 0, size, opts, nullptr);
+}
 
-    if (opts.optimal) {
-        return parse_optimal(data, size, opts);
-    }
-    return parse_greedy(data, size, opts);
+std::vector<LZ77Parser::Token> LZ77Parser::parse_range(
+    const uint8_t* data, size_t data_size, size_t start, size_t end,
+    const Options& opts, const MatchFinder* shared_mf) {
+    if (end > data_size) end = data_size;
+    if (start > end) start = end;
+    if (opts.optimal)
+        return parse_optimal(data, data_size, start, end, opts, shared_mf);
+    return parse_greedy(data, data_size, start, end, opts, shared_mf);
 }
 
 std::vector<LZ77Parser::Token> LZ77Parser::parse_greedy(
-    const uint8_t* data, size_t size, const Options& opts) {
+    const uint8_t* data, size_t data_size, size_t start, size_t end,
+    const Options& opts, const MatchFinder* shared_mf) {
 
     std::vector<Token> tokens;
-    tokens.reserve(size);
+    tokens.reserve(end - start + 1);
 
+    MatchFinder local_mf;
+    const MatchFinder* mf = shared_mf;
+    if (!mf) {
+        local_mf.chain_depth = opts.chain_depth;
+        local_mf.nice_len = opts.nice_len;
+        local_mf.row_stride = opts.row_stride;
+        local_mf.init(data, data_size);
+        mf = &local_mf;
+    }
 
-
-    // Original hash chain path
-    MatchFinder mf;
-    mf.chain_depth = opts.chain_depth;
-    mf.nice_len = opts.nice_len;
-    mf.row_stride = opts.row_stride;
-    mf.init(data, size);
-
-    size_t pos = 0;
-    while (pos < size) {
+    size_t pos = start;
+    while (pos < end) {
         // === Run-length pre-scan ===
-        // Check for consecutive identical bytes at common distances.
-        // This avoids hash chain overhead for solid-color regions (common in PNGs).
+        // Check for periodic patterns at common distances. A match at
+        // distance D starting at `pos` copies bytes from `pos - D`, so the
+        // seed bytes must also match: data[pos-D+i] == data[pos+i] for
+        // i in [0, D). Verifying only the forward repeats is insufficient
+        // (the byte before the run typically differs from the run value).
         // Distances: 1=same byte, 3=RGB filtered, 4=RGBA filtered.
         LZMatch rl_match{0, 0};
+        const size_t RL_MAX = static_cast<size_t>(deflate::MAX_MATCH_LEN);
 
         // Check distance=1 (identical consecutive bytes)
-        if (pos + 4 <= size && data[pos] == data[pos + 1] &&
-            data[pos] == data[pos + 2] && data[pos] == data[pos + 3]) {
-            size_t run = 4;
-            while (pos + run < size && run < static_cast<size_t>(deflate::MAX_MATCH_LEN) &&
+        if (pos >= 1 && data[pos - 1] == data[pos]) {
+            size_t run = 1;
+            while (pos + run < end && run < RL_MAX &&
                    data[pos + run] == data[pos]) ++run;
-            rl_match.length = static_cast<uint16_t>(std::min(run, static_cast<size_t>(deflate::MAX_MATCH_LEN)));
+            rl_match.length = static_cast<uint16_t>(run);
             rl_match.distance = 1;
         }
 
         // Check distance=3 (RGB filtered: Sub-filter produces 3-byte patterns)
-        if (rl_match.length == 0 && pos + 7 <= size &&
-            data[pos] == data[pos + 3] && data[pos + 1] == data[pos + 4] &&
-            data[pos + 2] == data[pos + 5] && data[pos] == data[pos + 6]) {
+        if (rl_match.length == 0 && pos >= 3 && pos + 3 <= end &&
+            data[pos - 3] == data[pos] &&
+            data[pos - 2] == data[pos + 1] &&
+            data[pos - 1] == data[pos + 2]) {
             size_t run = 3;
-            while (pos + run + 3 <= size &&
-                   run + 3 <= static_cast<size_t>(deflate::MAX_MATCH_LEN) &&
-                   data[pos + run] == data[pos + run + 3]) ++run;
-            rl_match.length = static_cast<uint16_t>(std::min(run + 3, static_cast<size_t>(deflate::MAX_MATCH_LEN)));
+            while (pos + run < end && run < RL_MAX &&
+                   data[pos + run] == data[pos + run - 3]) ++run;
+            rl_match.length = static_cast<uint16_t>(run);
             rl_match.distance = 3;
         }
 
         // Check distance=4 (RGBA filtered: Sub-filter produces 4-byte patterns)
-        if (rl_match.length == 0 && pos + 8 <= size &&
-            data[pos] == data[pos + 4] && data[pos + 1] == data[pos + 5] &&
-            data[pos + 2] == data[pos + 6] && data[pos] == data[pos + 8]) {
+        if (rl_match.length == 0 && pos >= 4 && pos + 4 <= end &&
+            data[pos - 4] == data[pos] &&
+            data[pos - 3] == data[pos + 1] &&
+            data[pos - 2] == data[pos + 2] &&
+            data[pos - 1] == data[pos + 3]) {
             size_t run = 4;
-            while (pos + run + 4 <= size &&
-                   run + 4 <= static_cast<size_t>(deflate::MAX_MATCH_LEN) &&
-                   data[pos + run] == data[pos + run + 4]) ++run;
-            rl_match.length = static_cast<uint16_t>(std::min(run + 4, static_cast<size_t>(deflate::MAX_MATCH_LEN)));
+            while (pos + run < end && run < RL_MAX &&
+                   data[pos + run] == data[pos + run - 4]) ++run;
+            rl_match.length = static_cast<uint16_t>(run);
             rl_match.distance = 4;
         }
 
@@ -242,11 +300,14 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_greedy(
         if (rl_match.length >= static_cast<uint16_t>(opts.min_match)) {
             match = rl_match;
         } else {
-            match = mf.find_longest(pos, opts.min_match);
+            match = mf->find_longest(pos, opts.min_match);
         }
+        // A match may not extend beyond the end of this block.
+        if (match.length > end - pos)
+            match.length = static_cast<uint16_t>(end - pos);
 
         if (opts.lazy_matching && match.length >= opts.min_match &&
-            pos + 1 < size) {
+            pos + 1 < end) {
             // Multi-step lazy matching: check pos+1 through pos+lazy_depth
             // for a better deferred match. If one is found, emit literals
             // for the skipped positions and use the deferred match instead.
@@ -254,8 +315,11 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_greedy(
             LZMatch best_deferred = match;
             int best_skip = 0;
 
-            for (int skip = 1; skip <= lazy_steps && pos + skip < size; ++skip) {
-                auto cand = mf.find_longest(pos + static_cast<size_t>(skip), opts.min_match);
+            for (int skip = 1; skip <= lazy_steps && pos + skip < end; ++skip) {
+                auto cand = mf->find_longest(pos + static_cast<size_t>(skip),
+                                             opts.min_match);
+                if (cand.length > end - (pos + skip))
+                    cand.length = static_cast<uint16_t>(end - (pos + skip));
                 if (cand.length > best_deferred.length + static_cast<uint16_t>(skip)) {
                     best_deferred = cand;
                     best_skip = skip;
@@ -287,83 +351,92 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_greedy(
     }
 
     // Finalize: emit end-of-block
-            tokens.push_back({Token::LITERAL, 0, 0, 0}); // EOB marker
+    tokens.push_back({Token::LITERAL, 0, 0, 0}); // EOB marker
     return tokens;
 }
 
 std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
-    const uint8_t* data, size_t size, const Options& opts) {
+    const uint8_t* data, size_t data_size, size_t start, size_t end,
+    const Options& opts, const MatchFinder* shared_mf) {
 
     constexpr uint64_t INF = std::numeric_limits<uint64_t>::max();
+    const size_t len = end - start;
+
     // Reuse buffers across iterations (they only grow).
     auto& cost = ws_.cost;
     auto& prev_match_len = ws_.prev_match_len;
     auto& prev_match_dist = ws_.prev_match_dist;
     auto& is_literal = ws_.is_literal;
-    cost.assign(size + 1, INF);
-    prev_match_len.assign(size + 1, 0);
-    prev_match_dist.assign(size + 1, 0);
-    is_literal.assign(size + 1, false);
+    cost.assign(len + 1, INF);
+    prev_match_len.assign(len + 1, 0);
+    prev_match_dist.assign(len + 1, 0);
+    is_literal.assign(len + 1, false);
     cost[0] = 0;
 
-
-
-    // Hash chain path
-    MatchFinder mf;
-    mf.chain_depth = opts.chain_depth;
-    mf.nice_len = opts.nice_len;
-    mf.row_stride = opts.row_stride;
-    mf.init(data, size);
+    MatchFinder local_mf;
+    const MatchFinder* mf = shared_mf;
+    if (!mf) {
+        local_mf.chain_depth = opts.chain_depth;
+        local_mf.nice_len = opts.nice_len;
+        local_mf.row_stride = opts.row_stride;
+        local_mf.init(data, data_size);
+        mf = &local_mf;
+    }
 
     auto& matches = ws_.matches;
     matches.reserve(128);
 
-    for (size_t i = 0; i < size; ++i) {
-        if (cost[i] == INF) continue;
+    for (size_t li = 0; li < len; ++li) {
+        if (cost[li] == INF) continue;
+        size_t i = start + li;
 
         // Option 1: emit literal
-        if (i + 1 <= size) {
-            uint64_t c = cost[i] + opts.cost_model.literal_cost(data[i]);
-            if (c < cost[i + 1]) {
-                cost[i + 1] = c;
-                is_literal[i + 1] = true;
+        {
+            uint64_t c = cost[li] + opts.cost_model.literal_cost(data[i]);
+            if (c < cost[li + 1]) {
+                cost[li + 1] = c;
+                is_literal[li + 1] = true;
             }
         }
 
-        // Option 2: emit match
-        mf.find_all(i, matches, opts.min_match);
+        // Option 2: emit match (clamped to the block end)
+        mf->find_all(i, matches, opts.min_match);
         for (auto& m : matches) {
-            size_t end = i + m.length;
-            if (end > size) end = size;
-            uint64_t c = cost[i] + opts.cost_model.match_cost(m.length, m.distance);
-            if (c < cost[end]) {
-                cost[end] = c;
-                prev_match_len[end] = m.length;
-                prev_match_dist[end] = m.distance;
-                is_literal[end] = false;
+            size_t mlen = m.length;
+            if (mlen > end - i) mlen = end - i;
+            if (mlen < static_cast<size_t>(opts.min_match)) continue;
+            size_t nli = li + mlen;
+            uint64_t c = cost[li] +
+                         opts.cost_model.match_cost(static_cast<uint16_t>(mlen),
+                                                    m.distance);
+            if (c < cost[nli]) {
+                cost[nli] = c;
+                prev_match_len[nli] = static_cast<int>(mlen);
+                prev_match_dist[nli] = m.distance;
+                is_literal[nli] = false;
             }
         }
     }
 
     // Backtrack to build token list
     std::vector<Token> tokens;
-    tokens.reserve(size);
-    size_t pos = size;
+    tokens.reserve(len + 1);
+    size_t pos = len;
 
     while (pos > 0) {
         if (is_literal[pos]) {
             --pos;
-            tokens.push_back({Token::LITERAL, data[pos], 0, 0});
+            tokens.push_back({Token::LITERAL, data[start + pos], 0, 0});
         } else {
-            uint16_t len = static_cast<uint16_t>(prev_match_len[pos]);
-            uint16_t dist = static_cast<uint16_t>(prev_match_dist[pos]);
-            pos -= len;
-            tokens.push_back({Token::MATCH, 0, len, dist});
+            uint16_t l = static_cast<uint16_t>(prev_match_len[pos]);
+            uint16_t d = static_cast<uint16_t>(prev_match_dist[pos]);
+            pos -= l;
+            tokens.push_back({Token::MATCH, 0, l, d});
         }
     }
 
     std::reverse(tokens.begin(), tokens.end());
-    // Add EOB sentinel (required by write_fixed_block / write_dynamic_block)
+    // Add EOB sentinel (required by the block writers)
     tokens.push_back({Token::LITERAL, 0, 0, 0});
     return tokens;
 }

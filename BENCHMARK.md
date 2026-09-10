@@ -76,8 +76,7 @@ fpng's re-compression matches or improves on the original encoder in most cases.
 ### Round-trip Correctness
 
 - **Self-consistency**: Output can be read back by fpng's own reader — verified for all standard color types and bit depths
-- **20/20 tests passing**: CRC32, all 5 filter types roundtrip, Paeth predictor, stored/fixed/dynamic DEFLATE, interlaced PNG, zlib compress/decompress
-- **Known issue**: 2-bit grayscale images cause memory corruption (pre-existing, unrelated to changes)
+- **30/30 tests passing**: CRC32, all 5 filter types roundtrip, Paeth predictor, stored/fixed/dynamic DEFLATE, multi-block DEFLATE, Huffman optimality, interlaced PNG, zlib compress/decompress
 
 ### Changes Since Initial Release
 
@@ -131,6 +130,46 @@ Pure-encoding-speed improvements verified to produce byte-identical output:
 | Total output size | 142,450 B | 142,455 B | +5 B (noise) |
 
 The GA fitness table gives the largest gains on large (level ≥ 7) images; the corpus is mostly small images, so the aggregate speedup understates the per-image impact.
+
+## Correctness Fixes and Re-Measurement
+
+A compression audit uncovered several correctness defects that produced
+silently corrupt IDAT streams (which also skewed earlier size measurements).
+All outputs are now verified by decoding with an independent decoder (Pillow):
+
+- **Run-length pre-scan seeded matches incorrectly.** The greedy parser's
+  distance-1/3/4 fast path asserted periodicity from `pos`, but an LZ77 match
+  at distance D copies from `pos-D`, so the seed bytes were never checked.
+  With `iterations == 1` these tokens were emitted directly and corrupted
+  output.
+- **Blocks were padded to byte boundaries.** Each DEFLATE block used its own
+  `BitWriter` and flushed between blocks, inserting padding bits mid-stream.
+  Huffman blocks must share one continuous bitstream; only stored blocks force
+  byte alignment.
+- **The LZ77 window reset per block.** Every block rebuilt its match finder
+  over just that block, so matches could not cross block boundaries and the
+  32 KB sliding window was effectively truncated.
+- **Interlaced sub-byte scanlines** (indexed/grayscale, bit depth < 8) used a
+  byte-per-pixel stride in the Adam7 path, causing heap corruption.
+- **16-bit sample handling** in alpha zeroing and palette sorting, plus
+  out-of-bounds analysis reads for bit-packed formats.
+- **Filter search used a stored-block proxy**, returning identical sizes for
+  every candidate and always selecting filter None at levels 3-4.
+- **Color reduction was dead code.** It is now a strategy dimension
+  (indexed/gray/8-bit compared against truecolor) and accounts for PLTE
+  overhead in the proxy ranking.
+- **SIMD was never enabled on x86** (the header guarded on `__AVX2__` while
+  CMake defined `FPNG_HAS_AVX2` and added no arch flag). It is now active.
+
+Measured on the bundled corpus (223 images, `-o9 -j4`):
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Outputs with valid round-trip | 90 / 199 | **205 / 205** |
+| Total output | 145,498 B (post-correctness baseline) | **139,179 B (−4.3%)** |
+| Compression ratio (out/in) | 17.35% | **16.60%** |
+| Total time | 782 s | **~66 s** |
+| Failing reads (`basi*`, `s36/38`, `cten*`) | crashes/errors | **fixed** |
 
 ## Running Your Own Benchmarks
 

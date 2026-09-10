@@ -22,10 +22,10 @@ enum class CompressionLevel {
 struct DeflateOptions {
     CompressionLevel level = CompressionLevel::Best;
     int iterations = 1;
-    bool optimal_parsing = false;
     bool adaptive_blocks = true;
     size_t max_block_size = 0;   // 0=auto (scales with data size)
     int  chain_depth = 0;        // 0=auto (selected by compression level)
+    int  row_stride = 0;         // filtered row byte stride (raw_scanline+1), 0=unknown
     bool verbose = false;
 };
 

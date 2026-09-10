@@ -1,6 +1,8 @@
 #include "test/test_framework.hpp"
 #include "compress/deflate/huffman.hpp"
 #include "compress/deflate/constants.hpp"
+#include "compress/deflate/deflater.hpp"
+#include "compress/deflate/inflate.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -150,4 +152,42 @@ void test_deflate() {
     test_huffman_basic();
     std::cout << "\n";
     test_huffman_optimality_vs_brute();
+}
+
+// Regression tests for the DEFLATE block stream: multiple blocks must share a
+// single continuous bit stream (no inter-block padding), stored blocks must be
+// byte-aligned, and the sliding window must persist across block boundaries.
+void test_deflate_repro() {
+    std::cout << "Deflate Multi-block Tests:\n";
+
+    auto roundtrip = [](const std::vector<uint8_t>& f, unsigned long lvl,
+                        int iters, bool adaptive) -> bool {
+        fpng::DeflateOptions o;
+        o.level = static_cast<fpng::CompressionLevel>(lvl);
+        o.iterations = iters;
+        o.adaptive_blocks = adaptive;
+        o.chain_depth = 256; // keep the test fast
+        auto c = fpng::zlib_compress(f, o);
+        std::vector<uint8_t> b;
+        try { b = fpng::inflate_zlib(c); } catch (...) { return false; }
+        return b == f;
+    };
+
+    bool ok = true;
+    // Sizes chosen to straddle block boundaries and to produce a small trailing
+    // block (stored) after a large dynamic block.
+    for (size_t n : {size_t(1000), size_t(65535), size_t(65536 + 128),
+                     size_t(70000)}) {
+        for (int pattern = 0; pattern < 3; ++pattern) {
+            std::vector<uint8_t> d(n);
+            for (size_t i = 0; i < n; ++i)
+                d[i] = pattern == 0 ? 0xAA
+                     : pattern == 1 ? static_cast<uint8_t>(i * 31 + (i >> 8))
+                                    : static_cast<uint8_t>(i * 2654435761u);
+            for (int lvl : {6, 9, 12})
+                for (int it : {1, 2})
+                    if (!roundtrip(d, lvl, it, true)) ok = false;
+        }
+    }
+    run_test("deflate multi-block roundtrip (stored/dynamic/fixed)", ok);
 }

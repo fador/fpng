@@ -9,6 +9,7 @@ extern void test_inflate();
 extern void test_roundtrip();
 extern void test_full_compress_pipeline();
 extern void test_deflate();
+extern void test_deflate_repro();
 
 int main() {
     std::cout << "fpng Test Suite\n";
@@ -23,6 +24,8 @@ int main() {
     test_inflate();
     std::cout << "\n";
     test_deflate();
+    std::cout << "\n";
+    test_deflate_repro();
     std::cout << "\n";
     test_roundtrip();
     std::cout << "\n";

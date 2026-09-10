@@ -9,6 +9,7 @@
 #include "util/file.hpp"
 
 #include <cstring>
+#include <climits>
 
 namespace fpng {
 
@@ -193,9 +194,7 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img,
             if (p.y0 >= img.height) ph = 0;
             if (pw == 0 || ph == 0) continue;
 
-            size_t pass_stride = (img.color_type == 3)
-                ? ((static_cast<size_t>(pw) * img.bit_depth + 7) / 8)
-                : (static_cast<size_t>(pw) * bpp);
+            size_t pass_stride = img.scanline_size_for_width(pw);
 
             std::vector<uint8_t> prev_row(pass_stride, 0);
             std::vector<uint8_t> row_buf(1 + pass_stride);
@@ -208,8 +207,8 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img,
 
                 // Extract this pass's pixels from the source row
                 std::vector<uint8_t> pass_row(pass_stride, 0);
-                if (img.color_type == 3) {
-                    // Bit-packed indexed
+                if (img.bit_depth < 8) {
+                    // Bit-packed indexed or grayscale
                     for (uint32_t px = 0; px < pw; ++px) {
                         uint32_t img_x = p.x0 + px * p.dx;
                         if (img_x >= img.width) continue;
@@ -241,18 +240,21 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img,
         }
     } else {
         std::vector<uint8_t> prev_scanline(raw_ss, 0);
+        std::vector<uint8_t> row_buf(1 + raw_ss);
         for (size_t y = 0; y < height; ++y) {
             const uint8_t* src = img.pixels.data() + y * raw_ss;
-            uint8_t row_buf[1 + 65536];
             FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
-            filter_scanline(ft, src, row_buf, bpp, raw_ss,
+            filter_scanline(ft, src, row_buf.data(), bpp, raw_ss,
                              y > 0 ? prev_scanline.data() : nullptr);
-            filtered.insert(filtered.end(), row_buf, row_buf + 1 + raw_ss);
+            filtered.insert(filtered.end(), row_buf.begin(), row_buf.end());
             std::memcpy(prev_scanline.data(), src, raw_ss);
         }
     }
 
-    return zlib_compress(filtered, wopts.deflate);
+    DeflateOptions deflate = wopts.deflate;
+    if (deflate.row_stride == 0 && raw_ss + 1 <= INT_MAX)
+        deflate.row_stride = static_cast<int>(raw_ss + 1);
+    return zlib_compress(filtered, deflate);
 }
 
 std::vector<uint8_t> PNGWriter::filter_and_compress_frame(const Image& img,
@@ -260,26 +262,26 @@ std::vector<uint8_t> PNGWriter::filter_and_compress_frame(const Image& img,
     if (finfo.image_data.empty()) return {};
 
     size_t bpp = img.bytes_per_pixel();
-    size_t raw_ss = (img.color_type == 3)
-        ? ((static_cast<size_t>(finfo.width) * img.bit_depth + 7) / 8)
-        : (static_cast<size_t>(finfo.width) * bpp);
+    size_t raw_ss = img.scanline_size_for_width(finfo.width);
     size_t height = finfo.height;
 
     std::vector<uint8_t> filtered;
     filtered.reserve((raw_ss + 1) * height);
 
     std::vector<uint8_t> prev_scanline(raw_ss, 0);
+    std::vector<uint8_t> row_buf(1 + raw_ss);
 
     for (size_t y = 0; y < height; ++y) {
         const uint8_t* src = finfo.image_data.data() + y * raw_ss;
-        uint8_t row_buf[1 + 65536];
-        filter_scanline(FilterType::None, src, row_buf, bpp, raw_ss,
+        filter_scanline(FilterType::None, src, row_buf.data(), bpp, raw_ss,
                          y > 0 ? prev_scanline.data() : nullptr);
-        filtered.insert(filtered.end(), row_buf, row_buf + 1 + raw_ss);
+        filtered.insert(filtered.end(), row_buf.begin(), row_buf.end());
         std::memcpy(prev_scanline.data(), src, raw_ss);
     }
 
-    return zlib_compress(filtered);
+    DeflateOptions deflate;
+    if (raw_ss + 1 <= INT_MAX) deflate.row_stride = static_cast<int>(raw_ss + 1);
+    return zlib_compress(filtered, deflate);
 }
 
 std::vector<uint8_t> PNGWriter::write(const Image& img,

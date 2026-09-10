@@ -39,6 +39,7 @@ struct Strategy {
     bool alpha_zero;
     bool palette_sort;
     std::string name;
+    bool color_reduce = false; // try RGB->gray, truecolor->indexed, 16->8-bit
 };
 
 // Get the list of strategies to try for a given option level

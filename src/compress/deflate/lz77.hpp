@@ -102,11 +102,24 @@ public:
                               const Options& opts);
     std::vector<Token> parse(const uint8_t* data, size_t size);
 
+    // Parse a sub-range [start, end) of a larger buffer, optionally using a
+    // shared match finder built over the whole buffer so that matches may
+    // reference data before `start` (preserving the DEFLATE sliding window
+    // across block boundaries).
+    std::vector<Token> parse_range(const uint8_t* data, size_t data_size,
+                                   size_t start, size_t end,
+                                   const Options& opts,
+                                   const MatchFinder* shared_mf = nullptr);
+
 private:
-    std::vector<Token> parse_greedy(const uint8_t* data, size_t size,
-                                     const Options& opts);
-    std::vector<Token> parse_optimal(const uint8_t* data, size_t size,
-                                      const Options& opts);
+    std::vector<Token> parse_greedy(const uint8_t* data, size_t data_size,
+                                     size_t start, size_t end,
+                                     const Options& opts,
+                                     const MatchFinder* shared_mf);
+    std::vector<Token> parse_optimal(const uint8_t* data, size_t data_size,
+                                      size_t start, size_t end,
+                                      const Options& opts,
+                                      const MatchFinder* shared_mf);
 
     // Reusable DP workspace, persisted across parse() calls so the iterative
     // Huffman-refinement loop does not reallocate these buffers each pass.

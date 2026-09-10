@@ -93,14 +93,14 @@ std::vector<uint16_t> compute_entropy_costs(
 }
 
 // Forward declarations
-void write_stored_block(const uint8_t* data, size_t size,
-                         bool is_last, std::vector<uint8_t>& out);
-void write_fixed_block(const uint8_t* data, size_t size,
-                        bool is_last, const DeflateOptions& opts,
-                        std::vector<uint8_t>& out);
-void write_dynamic_block(const uint8_t* data, size_t size,
-                          bool is_last, const DeflateOptions& opts,
-                          std::vector<uint8_t>& out);
+void write_stored_block(BitWriter& bw, const uint8_t* data, size_t size,
+                         bool is_last);
+void write_fixed_block(BitWriter& bw, const uint8_t* full_data, size_t full_size,
+                        size_t start, size_t size, bool is_last,
+                        const DeflateOptions& opts, const MatchFinder* mf);
+void write_dynamic_block(BitWriter& bw, const uint8_t* full_data, size_t full_size,
+                          size_t start, size_t size, bool is_last,
+                          const DeflateOptions& opts, const MatchFinder* mf);
 
 // Fixed Huffman code table (RFC 1951 section 3.2.6)
 // Codes are MSB-first; we'll reverse for LSB-first output
@@ -119,9 +119,9 @@ FixedCode get_fixed_dist(int code) {
 }
 
 // Encode using fixed Huffman blocks
-void write_fixed_block(const uint8_t* data, size_t size,
-                        bool is_last, const DeflateOptions& opts,
-                        std::vector<uint8_t>& out) {
+void write_fixed_block(BitWriter& bw, const uint8_t* full_data, size_t full_size,
+                        size_t start, size_t size, bool is_last,
+                        const DeflateOptions& opts, const MatchFinder* mf) {
     LZ77Parser parser;
     LZ77Parser::Options parse_opts;
     parse_opts.chain_depth = opts.chain_depth;
@@ -135,9 +135,9 @@ void write_fixed_block(const uint8_t* data, size_t size,
         if (iter == 0) {
             parse_opts.optimal = false;
             parse_opts.lazy_matching = true;
-            // Auto-detect row stride
-            parse_opts.row_stride = 0;
-            if (size >= 769 && size % 769 == 0) parse_opts.row_stride = 769;
+            // Row stride supplied by the caller (filtered scanline + 1); the
+            // match finder probes this distance for between-row matches.
+            parse_opts.row_stride = opts.row_stride;
         } else {
             parse_opts.optimal = true;
             // Use actual fixed Huffman costs, not entropy estimates.
@@ -156,10 +156,10 @@ void write_fixed_block(const uint8_t* data, size_t size,
             cm.precomputed_costs = fixed_costs.data();
             parse_opts.cost_model = cm;
         }
-        tokens = parser.parse(data, size, parse_opts);
+        tokens = parser.parse_range(full_data, full_size, start, start + size,
+                                    parse_opts, mf);
     }
 
-    BitWriter bw;
     bw.write_bits(is_last ? 1 : 0, 1);  // BFINAL
     bw.write_bits(1, 2);                 // BTYPE = fixed Huffman
 
@@ -186,17 +186,12 @@ void write_fixed_block(const uint8_t* data, size_t size,
     // EOB
     auto eob = get_fixed_litlen(256);
     bw.write_bits(reverse_bits_u32(eob.code, eob.bits), eob.bits);
-    bw.flush_to_byte();
-
-    out.insert(out.end(),
-               reinterpret_cast<const uint8_t*>(bw.bytes().data()),
-               reinterpret_cast<const uint8_t*>(bw.bytes().data()) + bw.byte_count());
 }
 
 // Encode using dynamic Huffman blocks (BTYPE=2)
-void write_dynamic_block(const uint8_t* data, size_t size,
-                           bool is_last, const DeflateOptions& opts,
-                           std::vector<uint8_t>& out) {
+void write_dynamic_block(BitWriter& bw, const uint8_t* full_data, size_t full_size,
+                           size_t start, size_t size, bool is_last,
+                           const DeflateOptions& opts, const MatchFinder* mf) {
     // Iterative refinement: parse, build Huffman, parse again with costs, repeat
     LZ77Parser parser;
     LZ77Parser::Options parse_opts;
@@ -211,17 +206,15 @@ void write_dynamic_block(const uint8_t* data, size_t size,
             parse_opts.optimal = false;
             // Lazy matching is counterproductive at deep chain depths
             parse_opts.lazy_matching = true;
-            // Auto-detect row stride for filtered PNG data: if data size
-            // divided by 769 produces a clean integer, it's likely 256-wide RGB
-            parse_opts.row_stride = 0;
-            if (size >= 769 && size % 769 == 0) parse_opts.row_stride = 769;
+            parse_opts.row_stride = opts.row_stride;
         } else {
             parse_opts.optimal = true;
             LZ77Parser::CostModel cm;
             cm.precomputed_costs = entropy_costs.data();
             parse_opts.cost_model = cm;
         }
-        tokens = parser.parse(data, size, parse_opts);
+        tokens = parser.parse_range(full_data, full_size, start, start + size,
+                                    parse_opts, mf);
 
         // Count frequencies
         uint32_t ll_freq[deflate::MAX_LITLEN_SYMS] = {};
@@ -250,7 +243,7 @@ void write_dynamic_block(const uint8_t* data, size_t size,
     bool has_any = false;
     for (auto v : ll_len) { if (v > 0) { has_any = true; break; } }
     if (!has_any) {
-        write_stored_block(data, size, is_last, out);
+        write_stored_block(bw, full_data + start, size, is_last);
         return;
     }
 
@@ -354,7 +347,6 @@ void write_dynamic_block(const uint8_t* data, size_t size,
         --hclen;
 
     // Step 6: Write the block
-    BitWriter bw;
     bw.write_bits(is_last ? 1 : 0, 1);        // BFINAL
     bw.write_bits(2, 2);                       // BTYPE = dynamic
     bw.write_bits(hlit - 257, 5);              // HLIT
@@ -402,36 +394,25 @@ void write_dynamic_block(const uint8_t* data, size_t size,
     // EOB
     auto& eob = ll_code[deflate::END_OF_BLOCK];
     bw.write_bits(reverse_bits_u32(eob.code, eob.bits), eob.bits);
-
-    bw.flush_to_byte();
-    out.insert(out.end(),
-               reinterpret_cast<const uint8_t*>(bw.bytes().data()),
-               reinterpret_cast<const uint8_t*>(bw.bytes().data()) + bw.byte_count());
 }
 
-void write_stored_block(const uint8_t* data, size_t size,
-                         bool is_last, std::vector<uint8_t>& out) {
-    BitWriter bw;
+void write_stored_block(BitWriter& bw, const uint8_t* data, size_t size,
+                         bool is_last) {
     bw.write_bits(is_last ? 1 : 0, 1);
     bw.write_bits(0, 2);
+    // A stored block must start on a byte boundary. Emit the current partial
+    // byte (containing the preceding block's trailing bits plus these header
+    // bits) padded with zeros; the decoder reads the header then discards the
+    // rest of that byte before LEN/NLEN.
     bw.flush_to_byte();
 
-    // Write the BitWriter's header bytes (BFINAL + BTYPE, padded to byte)
-    if (bw.byte_count() > 0) {
-        out.insert(out.end(),
-                   reinterpret_cast<const uint8_t*>(bw.bytes().data()),
-                   reinterpret_cast<const uint8_t*>(bw.bytes().data()) + bw.byte_count());
-    }
-
-    // Write stored block header
-    size_t pos = out.size();
-    out.resize(pos + 4);
     uint16_t len = static_cast<uint16_t>(size);
-    out[pos]     = static_cast<uint8_t>(len & 0xff);
-    out[pos + 1] = static_cast<uint8_t>((len >> 8) & 0xff);
-    out[pos + 2] = static_cast<uint8_t>((~len) & 0xff);
-    out[pos + 3] = static_cast<uint8_t>(((~len) >> 8) & 0xff);
-    out.insert(out.end(), data, data + size);
+    bw.write_byte(static_cast<uint8_t>(len & 0xff));
+    bw.write_byte(static_cast<uint8_t>((len >> 8) & 0xff));
+    bw.write_byte(static_cast<uint8_t>((~len) & 0xff));
+    bw.write_byte(static_cast<uint8_t>(((~len) >> 8) & 0xff));
+    for (size_t i = 0; i < size; ++i)
+        bw.write_byte(data[i]);
 }
 
 uint32_t compute_adler32(const uint8_t* data, size_t len) {
@@ -449,26 +430,34 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
                                          const DeflateOptions& opts) {
     if (data.empty()) return {};
 
+    // One continuous bit stream spans every block. Padding to a byte boundary
+    // is only applied at the very end (and internally at stored-block starts);
+    // flushing between Huffman blocks would insert spurious bits.
+    BitWriter bw;
+
     if (opts.level == CompressionLevel::Store) {
-        std::vector<uint8_t> out;
         size_t pos = 0;
         while (pos < data.size()) {
             size_t sz = std::min(data.size() - pos, size_t(65535));
-            write_stored_block(data.data() + pos, sz,
-                               pos + sz >= data.size(), out);
+            write_stored_block(bw, data.data() + pos, sz,
+                               pos + sz >= data.size());
             pos += sz;
         }
+        bw.flush_to_byte();
+        std::vector<uint8_t> out(bw.bytes().begin(),
+                                 bw.bytes().begin() + bw.byte_count());
         return out;
     }
 
-    // Use fixed Huffman blocks for compression.
     // Auto-scale: for large images (>=128K bytes filtered), use 8192-byte
     // blocks to specialize Huffman trees per data region. For smaller
     // images, use a single 65536-byte block to minimize tree overhead.
+    // Never exceed 65535 so every block remains eligible for a stored block.
     size_t eff_block_size = opts.max_block_size;
     if (eff_block_size == 0) {
         eff_block_size = (data.size() >= 131072) ? 8192 : 65536;
     }
+    eff_block_size = std::min(eff_block_size, size_t(65535));
     auto blocks = opts.adaptive_blocks
         ? BlockSplitter::split_greedy_adaptive(data.data(), data.size(),
                                                 4096, eff_block_size)
@@ -476,9 +465,6 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
 
     if (blocks.empty())
         blocks.push_back({0, data.size()});
-
-    std::vector<uint8_t> out;
-    out.reserve(data.size() + blocks.size() * 100);
 
     // Version with explicit opts
     DeflateOptions adjusted = opts;
@@ -492,6 +478,15 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
         }
     }
 
+    // One match finder spans the entire stream so that matches may reference
+    // data in earlier blocks (the DEFLATE sliding window persists across
+    // block boundaries). Rebuilding it per block truncated the window.
+    MatchFinder shared_mf;
+    shared_mf.chain_depth = adjusted.chain_depth;
+    shared_mf.nice_len = 32;
+    shared_mf.row_stride = adjusted.row_stride;
+    shared_mf.init(data.data(), data.size());
+
     for (size_t bi = 0; bi < blocks.size(); ++bi) {
         auto& b = blocks[bi];
         bool is_last = (bi == blocks.size() - 1);
@@ -502,8 +497,8 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
         // check byte entropy: low entropy means dynamic Huffman wins despite
         // tree overhead (a block of all-zeros compresses to ~15 bytes stored
         // but could be ~10 bytes dynamic).
-        bool use_stored = (opts.level <= CompressionLevel::Store);
-        if (!use_stored && adjusted.level < CompressionLevel::Ultra) {
+        bool use_stored = false;
+        if (adjusted.level < CompressionLevel::Ultra) {
             if (block_size < 256) {
                 use_stored = true;
             } else if (block_size < 512) {
@@ -525,19 +520,21 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
         }
 
         if (use_stored)
-            write_stored_block(data.data() + b.start_offset, block_size,
-                                is_last, out);
-        else if (adjusted.level >= CompressionLevel::Best)
-            write_dynamic_block(data.data() + b.start_offset,
-                                b.end_offset - b.start_offset,
-                                is_last, adjusted, out);
+            write_stored_block(bw, data.data() + b.start_offset, block_size,
+                               is_last);
+        else if (adjusted.level >= CompressionLevel::Default)
+            write_dynamic_block(bw, data.data(), data.size(),
+                                b.start_offset, block_size,
+                                is_last, adjusted, &shared_mf);
         else
-            write_fixed_block(data.data() + b.start_offset,
-                              b.end_offset - b.start_offset,
-                              is_last, adjusted, out);
+            write_fixed_block(bw, data.data(), data.size(),
+                              b.start_offset, block_size,
+                              is_last, adjusted, &shared_mf);
     }
 
-    return out;
+    bw.flush_to_byte();
+    return std::vector<uint8_t>(bw.bytes().begin(),
+                                bw.bytes().begin() + bw.byte_count());
 }
 
 std::vector<uint8_t> Deflater::compress_zlib(std::span<const uint8_t> data,
