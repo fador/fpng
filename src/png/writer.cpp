@@ -47,7 +47,8 @@ void PNGWriter::write_signature(std::vector<uint8_t>& out) {
     out.insert(out.end(), PNG_SIG, PNG_SIG + 8);
 }
 
-void PNGWriter::write_ihdr(std::vector<uint8_t>& out, const Image& img) {
+void PNGWriter::write_ihdr(std::vector<uint8_t>& out, const Image& img,
+                           const WriteOptions& wopts) {
     uint8_t ihdr[13];
     write_big32(ihdr, img.width);
     write_big32(ihdr + 4, img.height);
@@ -55,7 +56,7 @@ void PNGWriter::write_ihdr(std::vector<uint8_t>& out, const Image& img) {
     ihdr[9] = img.color_type;
     ihdr[10] = 0; // compression method = deflate
     ihdr[11] = 0; // filter method = adaptive
-    ihdr[12] = img.interlaced ? 1 : 0;
+    ihdr[12] = wopts.interlace ? 1 : 0;
 
     write_chunk(out, "IHDR", {ihdr, 13});
 }
@@ -180,7 +181,7 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img,
         filters = optimize_filters(img, fopts);
     }
 
-    if (img.interlaced) {
+    if (wopts.interlace) {
         struct { uint32_t x0, y0, dx, dy; } passes[7] = {
             {0,0,8,8}, {4,0,8,8}, {0,4,4,8}, {2,0,4,4}, {0,2,2,4}, {1,0,2,2}, {0,1,1,2}
         };
@@ -288,7 +289,7 @@ std::vector<uint8_t> PNGWriter::write(const Image& img,
                                        const WriteOptions& wopts) {
     std::vector<uint8_t> out;
     write_signature(out);
-    write_ihdr(out, img);
+    write_ihdr(out, img, wopts);
     write_ancillary(out, img);
     write_plte(out, img);
     write_trns(out, img);

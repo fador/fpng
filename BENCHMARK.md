@@ -174,15 +174,20 @@ Subsequent compression improvements:
   lengths), giving the optimal parser the cheapest shorter matches too.
 - **Actual Huffman code lengths** are used as the iterative-refinement cost
   model instead of entropy estimates.
+- **Non-interlaced output by default.** Adam7 splits each image into 7 passes
+  that the writer previously encoded with filter None only, so interlaced
+  inputs compressed far worse than the same pixels written progressively
+  (the reader already de-interlaces in memory). Interlaced inputs improved
+  24–43%; `WriteOptions::interlace` retains the old behavior.
 
 Measured on the bundled corpus (223 images, `-o9 -j4`):
 
 | Metric | Before | After |
 |--------|--------|-------|
 | Outputs with valid round-trip | 90 / 199 | **205 / 205** |
-| Total output | 145,498 B (post-correctness baseline) | **134,301 B (−7.7%)** |
-| Compression ratio (out/in) | 17.35% | **16.02%** |
-| Total time | 782 s | **~132 s** |
+| Total output | 145,498 B (post-correctness baseline) | **128,663 B (−11.6%)** |
+| Compression ratio (out/in) | 17.35% | **15.35%** |
+| Total time | 782 s | **~135 s** |
 | Failing reads (`basi*`, `s36/38`, `cten*`) | crashes/errors | **fixed** |
 
 

@@ -16,6 +16,10 @@ enum class FilterType : uint8_t;
 struct WriteOptions {
     std::vector<FilterType> filters;   // pre-computed filter choices (empty = auto)
     DeflateOptions deflate;            // deflate parameters
+    // Adam7 interlacing almost always compresses worse than the same image
+    // written progressively off; default to non-interlaced (the in-memory
+    // pixels are already de-interlaced by the reader).
+    bool interlace = false;
 };
 
 class PNGWriter {
@@ -31,7 +35,8 @@ public:
 
 private:
     void write_signature(std::vector<uint8_t>& out);
-    void write_ihdr(std::vector<uint8_t>& out, const Image& img);
+    void write_ihdr(std::vector<uint8_t>& out, const Image& img,
+                    const WriteOptions& wopts);
     void write_ancillary(std::vector<uint8_t>& out, const Image& img);
     void write_plte(std::vector<uint8_t>& out, const Image& img);
     void write_trns(std::vector<uint8_t>& out, const Image& img);
