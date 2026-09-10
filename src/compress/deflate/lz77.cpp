@@ -42,84 +42,114 @@ void MatchFinder::init(const uint8_t* data, size_t size) {
         else last = first_[k];
     }
     first_[INDEX_SIZE] = static_cast<int32_t>(sorted_.size());
+
+    // Build 3-byte "nearest previous occurrence" chain for length-3 matches.
+    prev3_.assign(size + 1, -1);
+    size_t hbits = 12;
+    while ((size_t(1) << hbits) < size * 2 && hbits < 21) ++hbits;
+    size_t hsize = size_t(1) << hbits;
+    hash3_table_.assign(hsize, -1);
+    for (size_t i = 0; i + 3 <= size; ++i) {
+        uint32_t key = (uint32_t(data[i]) << 16) |
+                       (uint32_t(data[i + 1]) << 8) | data[i + 2];
+        uint32_t h = (key * 2654435761u) >> (32 - hbits);
+        prev3_[i] = hash3_table_[h];
+        hash3_table_[h] = static_cast<int32_t>(i);
+    }
 }
 
 LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
-    if (pos + 4 > size_) return {0, 0};
+    if (pos + 3 > size_) return {0, 0};
 
     const uint8_t* cur = data_ + pos;
     size_t limit = std::min(pos, size_t(deflate::MAX_DIST));
     size_t max_match = std::min(size_ - pos, size_t(deflate::MAX_MATCH_LEN));
 
-    uint32_t tag;
-    std::memcpy(&tag, cur, 4);
+    auto score = [](size_t len, size_t dist) -> int {
+        int dc = deflate::distance_code(static_cast<uint16_t>(dist));
+        int extra = (dc >= 0) ? deflate::distance_extra_bits(dc) : 0;
+        return static_cast<int>(len) * 256 - extra * 32;
+    };
 
     LZMatch best{0, 0};
 
-    // Quick-lookup: narrow search range using high word of tag
-    uint32_t hi = tag >> 16;
-    int32_t lo = first_[hi];
-    int32_t hi_end = first_[hi + 1];
-    int32_t found = lo;
-
-    // Binary search for first occurrence of 'tag' within [lo, hi_end)
-    while (lo < hi_end) {
-        int32_t mid = lo + (hi_end - lo) / 2;
-        if (sorted_[mid].tag < tag) lo = mid + 1;
-        else hi_end = mid;
-    }
-    found = lo;
-
-    // Within the equal-tag group positions are ordered descending, so all
-    // entries with pos >= current pos precede the usable candidates. Binary
-    // search that boundary instead of linear-scanning past every future
-    // position (which made this O(N) per lookup / O(N^2) overall on a
-    // full-stream index).
-    {
-        int32_t a = found, b = static_cast<int32_t>(sorted_.size());
-        while (a < b) {
-            int32_t mid = a + (b - a) / 2;
-            if (sorted_[mid].tag <= tag) a = mid + 1;
-            else b = mid;
+    // Length-3 candidate from the 3-byte index (the 4-byte tag scan below
+    // cannot see it).
+    if (pos + 3 <= size_) {
+        int32_t p3 = prev3_[pos];
+        if (p3 >= 0 && static_cast<size_t>(p3) < pos &&
+            pos - static_cast<size_t>(p3) <= limit &&
+            data_[p3] == data_[pos] && data_[p3 + 1] == data_[pos + 1] &&
+            data_[p3 + 2] == data_[pos + 2]) {
+            best.length = deflate::MIN_MATCH_LEN;
+            best.distance = static_cast<uint16_t>(pos - static_cast<size_t>(p3));
         }
-        int32_t tag_end = a;
-        a = found; b = tag_end;
-        while (a < b) {
-            int32_t mid = a + (b - a) / 2;
-            if (sorted_[mid].pos >= static_cast<int32_t>(pos)) a = mid + 1;
-            else b = mid;
-        }
-        found = a;
     }
 
-    // Scan forward through all entries with matching tag
-    size_t scanned = 0;
-    while (found < static_cast<int32_t>(sorted_.size()) &&
-           sorted_[found].tag == tag && scanned < chain_depth) {
-        size_t candidate = static_cast<size_t>(sorted_[found].pos);
-        ++found;
-        if (candidate >= pos) continue;
-        size_t dist = pos - candidate;
-        if (dist > limit) continue;
+    if (pos + 4 <= size_) {
+        uint32_t tag;
+        std::memcpy(&tag, cur, 4);
 
-        size_t match_len = simd::match_length(data_ + candidate + 4, cur + 4,
-                                               max_match - 4) + 4;
-        // Cost-aware selection
-        int dc = deflate::distance_code(static_cast<uint16_t>(dist));
-        int extra = deflate::distance_extra_bits(dc);
-        int new_score = static_cast<int>(match_len) * 256 - extra * 32;
-        int bdc = deflate::distance_code(best.distance);
-        int bextra = deflate::distance_extra_bits(bdc);
-        int best_score = static_cast<int>(best.length) * 256 - bextra * 32;
+        // Quick-lookup: narrow search range using high word of tag
+        uint32_t hi = tag >> 16;
+        int32_t lo = first_[hi];
+        int32_t hi_end = first_[hi + 1];
+        int32_t found = lo;
 
-        if (new_score > best_score ||
-            (new_score == best_score && dist < best.distance)) {
-            best.length = static_cast<uint16_t>(match_len);
-            best.distance = static_cast<uint16_t>(dist);
-            if (match_len >= max_match || match_len >= static_cast<size_t>(nice_len))
-                break;
+        // Binary search for first occurrence of 'tag' within [lo, hi_end)
+        while (lo < hi_end) {
+            int32_t mid = lo + (hi_end - lo) / 2;
+            if (sorted_[mid].tag < tag) lo = mid + 1;
+            else hi_end = mid;
         }
-        ++scanned;
+        found = lo;
+
+        // Within the equal-tag group positions are ordered descending, so all
+        // entries with pos >= current pos precede the usable candidates. Binary
+        // search that boundary instead of linear-scanning past every future
+        // position (which made this O(N) per lookup / O(N^2) overall on a
+        // full-stream index).
+        {
+            int32_t a = found, b = static_cast<int32_t>(sorted_.size());
+            while (a < b) {
+                int32_t mid = a + (b - a) / 2;
+                if (sorted_[mid].tag <= tag) a = mid + 1;
+                else b = mid;
+            }
+            int32_t tag_end = a;
+            a = found; b = tag_end;
+            while (a < b) {
+                int32_t mid = a + (b - a) / 2;
+                if (sorted_[mid].pos >= static_cast<int32_t>(pos)) a = mid + 1;
+                else b = mid;
+            }
+            found = a;
+        }
+
+        // Scan forward through all entries with matching tag
+        size_t scanned = 0;
+        while (found < static_cast<int32_t>(sorted_.size()) &&
+               sorted_[found].tag == tag && scanned < chain_depth) {
+            size_t candidate = static_cast<size_t>(sorted_[found].pos);
+            ++found;
+            if (candidate >= pos) continue;
+            size_t dist = pos - candidate;
+            if (dist > limit) continue;
+
+            size_t match_len = simd::match_length(data_ + candidate + 4, cur + 4,
+                                                   max_match - 4) + 4;
+            int new_score = score(match_len, dist);
+            int best_score = score(best.length, best.distance);
+
+            if (new_score > best_score ||
+                (new_score == best_score && dist < best.distance)) {
+                best.length = static_cast<uint16_t>(match_len);
+                best.distance = static_cast<uint16_t>(dist);
+                if (match_len >= max_match || match_len >= static_cast<size_t>(nice_len))
+                    break;
+            }
+            ++scanned;
+        }
     }
 
     // Row-stride probe: the filter byte at row boundaries means the 4-byte
@@ -130,12 +160,8 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
         size_t row_pos = pos - static_cast<size_t>(row_stride);
         size_t mlen = simd::match_length(data_ + row_pos, cur, max_match);
         if (mlen >= 4) {
-            int dc = deflate::distance_code(static_cast<uint16_t>(row_stride));
-            int extra = deflate::distance_extra_bits(dc);
-            int new_score = static_cast<int>(mlen) * 256 - extra * 32;
-            int bdc = deflate::distance_code(best.distance);
-            int bextra = deflate::distance_extra_bits(bdc);
-            int best_score = static_cast<int>(best.length) * 256 - bextra * 32;
+            int new_score = score(mlen, row_stride);
+            int best_score = score(best.length, best.distance);
             if (new_score > best_score) {
                 best.length = static_cast<uint16_t>(mlen);
                 best.distance = static_cast<uint16_t>(row_stride);
@@ -149,66 +175,92 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
 void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
                             int /*min_len*/) const {
     matches.clear();
-    if (pos + 4 > size_) return;
+    if (pos + 3 > size_) return;
 
     const uint8_t* cur = data_ + pos;
     size_t limit = std::min(pos, size_t(deflate::MAX_DIST));
     size_t max_match = std::min(size_ - pos, size_t(deflate::MAX_MATCH_LEN));
 
-    uint32_t tag;
-    std::memcpy(&tag, cur, 4);
+    // 4-byte tag matches. Candidates are visited nearest-first (distance
+    // increasing). For each achievable match length keep the nearest distance:
+    // when a candidate reaches a new maximum length, emit an entry for every
+    // newly covered length at this (smallest) distance. This is the true
+    // min-cost frontier for the optimal parser (match cost is monotonic in
+    // distance for a fixed length), covering lengths MIN_MATCH..max_match.
+    if (pos + 4 <= size_) {
+        uint32_t tag;
+        std::memcpy(&tag, cur, 4);
 
-    // Binary search for matching tag
-    uint32_t hi = tag >> 16;
-    int32_t lo = first_[hi];
-    int32_t hi_end = first_[hi + 1];
-    while (lo < hi_end) {
-        int32_t mid = lo + (hi_end - lo) / 2;
-        if (sorted_[mid].tag < tag) lo = mid + 1;
-        else hi_end = mid;
+        // Binary search for matching tag
+        uint32_t hi = tag >> 16;
+        int32_t lo = first_[hi];
+        int32_t hi_end = first_[hi + 1];
+        while (lo < hi_end) {
+            int32_t mid = lo + (hi_end - lo) / 2;
+            if (sorted_[mid].tag < tag) lo = mid + 1;
+            else hi_end = mid;
+        }
+
+        // Skip entries with pos >= current pos (see find_longest).
+        {
+            int32_t a = lo, b = static_cast<int32_t>(sorted_.size());
+            while (a < b) {
+                int32_t mid = a + (b - a) / 2;
+                if (sorted_[mid].tag <= tag) a = mid + 1;
+                else b = mid;
+            }
+            int32_t tag_end = a;
+            a = lo; b = tag_end;
+            while (a < b) {
+                int32_t mid = a + (b - a) / 2;
+                if (sorted_[mid].pos >= static_cast<int32_t>(pos)) a = mid + 1;
+                else b = mid;
+            }
+            lo = a;
+        }
+
+        size_t scanned = 0;
+        size_t best_len = deflate::MIN_MATCH_LEN - 1; // first covered = MIN_MATCH
+        while (lo < static_cast<int32_t>(sorted_.size()) &&
+               sorted_[lo].tag == tag && scanned < chain_depth * 2) {
+            size_t candidate = static_cast<size_t>(sorted_[lo].pos);
+            ++lo;
+            if (candidate >= pos) continue;
+            size_t dist = pos - candidate;
+            if (dist > limit) continue;
+
+            size_t match_len = simd::match_length(data_ + candidate + 4, cur + 4,
+                                                   max_match - 4) + 4;
+            if (match_len > best_len) {
+                for (size_t L = best_len + 1; L <= match_len; ++L)
+                    matches.push_back({static_cast<uint16_t>(L),
+                                       static_cast<uint16_t>(dist)});
+                best_len = match_len;
+                if (match_len >= max_match) break;
+            }
+            ++scanned;
+        }
     }
 
-    // Skip entries with pos >= current pos (see find_longest).
+    // Length-3 nearest match from the 3-byte index. Replace the distance of
+    // the existing length-3 frontier entry (from a 4-byte match) if nearer, or
+    // insert if the 4-byte scan found nothing.
     {
-        int32_t a = lo, b = static_cast<int32_t>(sorted_.size());
-        while (a < b) {
-            int32_t mid = a + (b - a) / 2;
-            if (sorted_[mid].tag <= tag) a = mid + 1;
-            else b = mid;
+        int32_t p3 = prev3_[pos];
+        if (p3 >= 0 && static_cast<size_t>(p3) < pos &&
+            pos - static_cast<size_t>(p3) <= limit &&
+            data_[p3] == data_[pos] && data_[p3 + 1] == data_[pos + 1] &&
+            data_[p3 + 2] == data_[pos + 2]) {
+            uint16_t dist3 = static_cast<uint16_t>(pos - static_cast<size_t>(p3));
+            if (!matches.empty() &&
+                matches.front().length == deflate::MIN_MATCH_LEN) {
+                if (dist3 < matches.front().distance)
+                    matches.front().distance = dist3;
+            } else {
+                matches.insert(matches.begin(),
+                               {deflate::MIN_MATCH_LEN, dist3});
+            }
         }
-        int32_t tag_end = a;
-        a = lo; b = tag_end;
-        while (a < b) {
-            int32_t mid = a + (b - a) / 2;
-            if (sorted_[mid].pos >= static_cast<int32_t>(pos)) a = mid + 1;
-            else b = mid;
-        }
-        lo = a;
-    }
-
-    // Collect all matching positions. Candidates are visited nearest-first
-    // (distance increasing), so keep only matches that set a new longest
-    // length. Shorter-but-farther matches are dominated and would only bloat
-    // the optimal-parser DP. This caps the returned list at ~MAX_MATCH_LEN.
-    size_t scanned = 0;
-    size_t best_len = 0;
-    while (lo < static_cast<int32_t>(sorted_.size()) &&
-           sorted_[lo].tag == tag && scanned < chain_depth * 2) {
-        size_t candidate = static_cast<size_t>(sorted_[lo].pos);
-        ++lo;
-        if (candidate >= pos) continue;
-        size_t dist = pos - candidate;
-        if (dist > limit) continue;
-
-        size_t match_len = simd::match_length(data_ + candidate + 4, cur + 4,
-                                               max_match - 4) + 4;
-        if (match_len >= 4 && match_len > best_len) {
-            best_len = match_len;
-            matches.push_back({static_cast<uint16_t>(match_len),
-                               static_cast<uint16_t>(dist)});
-            if (match_len >= max_match) break;
-        }
-        ++scanned;
     }
 }
 

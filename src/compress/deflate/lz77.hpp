@@ -48,6 +48,12 @@ private:
     std::vector<TagEntry> sorted_;
     // Quick-lookup: first_[tag >> 16] = first index in sorted_ with that high word
     std::vector<int32_t> first_;
+
+    // Nearest previous position sharing the same 3-byte prefix, used to expose
+    // length-3 matches (the 4-byte tag index cannot see them). Hash table is
+    // sized to the input and verified against collisions on lookup.
+    std::vector<int32_t> prev3_;
+    std::vector<int32_t> hash3_table_;
 };
 
 // LZ77 parser with multiple strategies

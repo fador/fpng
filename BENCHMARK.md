@@ -161,15 +161,30 @@ All outputs are now verified by decoding with an independent decoder (Pillow):
 - **SIMD was never enabled on x86** (the header guarded on `__AVX2__` while
   CMake defined `FPNG_HAS_AVX2` and added no arch flag). It is now active.
 
+Subsequent compression improvements:
+
+- **64 KB DEFLATE blocks** (was 8 KB). The small size was a leftover from
+  per-block matching and mostly added Huffman tree overhead.
+- **Match extra bits scaled** into the Q10 optimal-parse cost model (they were
+  effectively ignored, weight 1/1024).
+- **3-byte matches.** The 4-byte-tag index cannot see length-3 matches; a
+  nearest-previous-3-byte index now feeds both greedy and optimal parsing.
+- **Min-distance-per-length frontier.** `find_all` returns, for every
+  achievable length, the nearest distance (instead of only record-breaking
+  lengths), giving the optimal parser the cheapest shorter matches too.
+- **Actual Huffman code lengths** are used as the iterative-refinement cost
+  model instead of entropy estimates.
+
 Measured on the bundled corpus (223 images, `-o9 -j4`):
 
 | Metric | Before | After |
 |--------|--------|-------|
 | Outputs with valid round-trip | 90 / 199 | **205 / 205** |
-| Total output | 145,498 B (post-correctness baseline) | **139,179 B (−4.3%)** |
-| Compression ratio (out/in) | 17.35% | **16.60%** |
-| Total time | 782 s | **~66 s** |
+| Total output | 145,498 B (post-correctness baseline) | **134,301 B (−7.7%)** |
+| Compression ratio (out/in) | 17.35% | **16.02%** |
+| Total time | 782 s | **~132 s** |
 | Failing reads (`basi*`, `s36/38`, `cten*`) | crashes/errors | **fixed** |
+
 
 ## Running Your Own Benchmarks
 
