@@ -192,20 +192,23 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
     // Filter strategies based on content and size
     std::vector<Strategy> filtered;
-    int max_filtered = is_huge ? 3 : (is_large ? 7 : (int)strategies.size());
-    bool ga_allowed = false; // allow exactly 1 GA strategy for large images
+    int max_filtered = is_huge ? 5 : (is_large ? 7 : (int)strategies.size());
+    bool ga_allowed = false; // allow exactly 1 GA strategy for large/huge images
 
     for (auto& s : strategies) {
-        // Skip GA strategies for huge images, allow 1 for large
-        if (is_huge && s.filter_level >= 5) continue;
-        if (is_large && s.filter_level >= 5) {
-            if (!ga_allowed) { ga_allowed = true; /* keep this one */ }
+        // Allow one GA (filter_level >= 5) strategy for large and huge images.
+        if ((is_large || is_huge) && s.filter_level >= 5) {
+            if (!ga_allowed) ga_allowed = true;
             else continue;
         }
-        if (is_huge && s.filter_level >= 3) continue;
 
-        // Skip high-iteration strategies for large images
-        if (s.deflate_iterations >= 3 && (is_large || is_huge)) continue;
+        // Skip only the most expensive iteration counts on large images; huge
+        // images can afford a little more (they are re-compressed with 2-3).
+        if (is_huge) {
+            if (s.deflate_iterations >= 5) continue;
+        } else if (is_large) {
+            if (s.deflate_iterations >= 3) continue;
+        }
 
         // For noise-like images, skip expensive strategies (nothing helps much)
         if (content.entropy_r > 7.5 && s.filter_level >= 3) continue;
@@ -289,11 +292,8 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         fopts.window_size = std::min(3, s.filter_level);
         fopts.ga_population = std::min(s.filter_level * 5, 20);
         fopts.ga_generations = std::min(s.filter_level * 5, 30);
-        // Reduce GA effort for large images, disable entirely for huge
-        if (is_huge) {
-            fopts.ga_population = 0;
-            fopts.ga_generations = 0;
-        } else if (is_large) {
+        // Reduce GA effort for large/huge images (still non-zero, filters matter)
+        if (is_huge || is_large) {
             fopts.ga_population = std::min(s.filter_level, 5);
             fopts.ga_generations = std::min(s.filter_level, 10);
         }
@@ -380,8 +380,9 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         size_t best_final = std::numeric_limits<size_t>::max();
         CompressResult best_result;
 
-        // For huge images, only re-compress the single best proxy to save time
-        int recompress_count = is_huge ? 1 : (is_large ? 2 : 3);
+        // Re-compress the top proxy winners with full settings. Large/huge
+        // images get fewer candidates but real filter/deflate effort.
+        int recompress_count = is_huge ? 2 : (is_large ? 2 : 3);
 
         // Force-include GA strategy in re-compress for large images
         // (its Fixed-Huffman proxy rank underrates it — Dynamic Huffman
@@ -412,10 +413,8 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
             FilterOptions fopts;
             fopts.level = strat.filter_level;
             fopts.window_size = std::min(3, strat.filter_level);
-            // Enable GA for large images (small population) to get better filters
-            if (is_huge) {
-                fopts.ga_population = 0; fopts.ga_generations = 0;
-            } else if (is_large) {
+            // Enable GA for large/huge images (small population) to get better filters
+            if (is_huge || is_large) {
                 fopts.ga_population = std::min(strat.filter_level, 5);
                 fopts.ga_generations = std::min(strat.filter_level, 10);
             } else {
@@ -427,10 +426,12 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
             DeflateOptions dopts;
             dopts.level = strat.deflate_level;
             dopts.iterations = strat.deflate_iterations;
-            dopts.adaptive_blocks = !is_huge; // adaptive for all but huge
+            dopts.adaptive_blocks = true;
             if (is_huge) {
-                dopts.iterations = std::min(dopts.iterations, 1);
-                dopts.level = CompressionLevel::Best;
+                // Spend real effort: 2-3 optimal-parse iterations.
+                dopts.iterations = std::max(2, std::min(strat.deflate_iterations, 3));
+                if (dopts.level < CompressionLevel::Best)
+                    dopts.level = CompressionLevel::Best;
             } else if (is_large) {
                 // Bump to at least 3 iterations for Huffman cost feedback on iter 3
                 dopts.iterations = std::max(std::min(dopts.iterations, 3), 3);
