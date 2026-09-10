@@ -70,7 +70,8 @@ public:
             uint64_t extra = deflate::length_extra_bits(lc)
                            + deflate::distance_extra_bits(dc);
             if (precomputed_costs)
-                return precomputed_costs[257 + lc] + precomputed_costs[288 + dc] + extra;
+                return precomputed_costs[257 + lc] + precomputed_costs[288 + dc]
+                     + (extra << 10); // extra bits must use the same Q10 scale
             if (!litlen_lengths || !dist_lengths) return 15 + length / 4;
             return litlen_lengths[257 + lc] + dist_lengths[dc] + extra;
         }
