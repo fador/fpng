@@ -429,8 +429,11 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
             dopts.iterations = strat.deflate_iterations;
             dopts.adaptive_blocks = true;
             if (is_huge) {
-                // Spend real effort: 2-3 optimal-parse iterations.
-                dopts.iterations = std::max(2, std::min(strat.deflate_iterations, 3));
+                // The global optimal parse converges slowly; more iterations
+                // pay off a lot on photographic data. Scale the count down for
+                // very large images to bound encoding time.
+                dopts.iterations = (raw_pixels <= 2621440) ? 6
+                                 : (raw_pixels <= 10485760) ? 3 : 2;
                 if (dopts.level < CompressionLevel::Best)
                     dopts.level = CompressionLevel::Best;
             } else if (is_large) {

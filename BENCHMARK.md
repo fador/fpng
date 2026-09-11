@@ -179,21 +179,28 @@ Subsequent compression improvements:
   inputs compressed far worse than the same pixels written progressively
   (the reader already de-interlaces in memory). Interlaced inputs improved
   24–43%; `WriteOptions::interlace` retains the old behavior.
+- **Token-stream block splitting.** The filtered stream is now parsed once
+  globally (so matches may span block boundaries) and block boundaries are
+  chosen by a DP over the token stream that minimizes the estimated Huffman
+  cost (symbol entropy + match extra bits + tree overhead). This replaced the
+  byte-entropy heuristic, which over-split homogeneous data. Huge images use
+  several optimal-parse iterations for convergence, scaled down with size.
+  Corpus: −150 B with no regressions (PngSuite −97); Kodak `kodim01`
+  699,053 → 693,997.
 - **Large/huge images no longer starved of effort.** The huge path was limited
   to entropy filters, no GA, a single re-compress candidate and one deflate
-  iteration. It now allows a GA/hill-climb strategy, 2–3 optimal-parse
-  iterations, two re-compress candidates and the uniform-filter polish. On four
-  Kodak photos (768×512): 2,906,623 → 2,806,285 B (−3.5%) and all now beat the
-  originals by 2–5% (e.g. `kodim23` 580,308 → 544,970).
+  iteration. It now allows a GA/hill-climb strategy, the uniform-filter polish
+  and multiple re-compress candidates. On four Kodak photos (768×512):
+  2,906,623 → 2,799,607 B (−3.7%) and all beat the originals by 2–5%.
 
 Measured on the bundled corpus (223 images, `-o9 -j4`):
 
 | Metric | Before | After |
 |--------|--------|-------|
 | Outputs with valid round-trip | 90 / 199 | **205 / 205** |
-| Total output | 145,498 B (post-correctness baseline) | **128,663 B (−11.6%)** |
-| Compression ratio (out/in) | 17.35% | **15.35%** |
-| Total time | 782 s | **~135 s** |
+| Total output | 145,498 B (post-correctness baseline) | **128,513 B (−11.7%)** |
+| Compression ratio (out/in) | 17.35% | **15.33%** |
+| Total time | 782 s | **~133 s** |
 | Failing reads (`basi*`, `s36/38`, `cten*`) | crashes/errors | **fixed** |
 
 

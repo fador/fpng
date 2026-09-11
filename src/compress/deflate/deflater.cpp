@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <vector>
+#include <limits>
 
 namespace fpng {
 
@@ -16,12 +17,12 @@ namespace {
 // Forward declarations
 void write_stored_block(BitWriter& bw, const uint8_t* data, size_t size,
                          bool is_last);
-void write_fixed_block(BitWriter& bw, const uint8_t* full_data, size_t full_size,
-                        size_t start, size_t size, bool is_last,
-                        const DeflateOptions& opts, const MatchFinder* mf);
-void write_dynamic_block(BitWriter& bw, const uint8_t* full_data, size_t full_size,
-                          size_t start, size_t size, bool is_last,
-                          const DeflateOptions& opts, const MatchFinder* mf);
+void encode_fixed_tokens(BitWriter& bw,
+                         const std::vector<LZ77Parser::Token>& tokens,
+                         size_t begin, size_t end, bool is_last);
+void encode_dynamic_tokens(BitWriter& bw,
+                           const std::vector<LZ77Parser::Token>& tokens,
+                           size_t begin, size_t end, bool is_last);
 
 // Fixed Huffman code table (RFC 1951 section 3.2.6)
 // Codes are MSB-first; we'll reverse for LSB-first output
@@ -40,51 +41,14 @@ FixedCode get_fixed_dist(int code) {
 }
 
 // Encode using fixed Huffman blocks
-void write_fixed_block(BitWriter& bw, const uint8_t* full_data, size_t full_size,
-                        size_t start, size_t size, bool is_last,
-                        const DeflateOptions& opts, const MatchFinder* mf) {
-    LZ77Parser parser;
-    LZ77Parser::Options parse_opts;
-    parse_opts.chain_depth = opts.chain_depth;
-    
-    // Iterative refinement
-    LZ77Parser::CostModel cm;
-    int iters = std::max(1, opts.iterations);
-    std::vector<LZ77Parser::Token> tokens;
-
-    for (int iter = 0; iter < iters; ++iter) {
-        if (iter == 0) {
-            parse_opts.optimal = false;
-            parse_opts.lazy_matching = true;
-            // Row stride supplied by the caller (filtered scanline + 1); the
-            // match finder probes this distance for between-row matches.
-            parse_opts.row_stride = opts.row_stride;
-        } else {
-            parse_opts.optimal = true;
-            // Use actual fixed Huffman costs, not entropy estimates.
-            // Fixed Huffman: litlen 0-143=8, 144-255=9, EOB=7, 257-279=7,
-            // 280-285=8, distance=5. These are the costs the encoder uses.
-            static std::vector<uint16_t> fixed_costs;
-            if (fixed_costs.empty()) {
-                fixed_costs.resize(288 + 32);
-                for (int i = 0; i <= 143; ++i) fixed_costs[i] = 8 * 1024;
-                for (int i = 144; i <= 255; ++i) fixed_costs[i] = 9 * 1024;
-                fixed_costs[256] = 7 * 1024; // EOB
-                for (int i = 257; i <= 279; ++i) fixed_costs[i] = 7 * 1024;
-                for (int i = 280; i <= 285; ++i) fixed_costs[i] = 8 * 1024;
-                for (int i = 0; i < 32; ++i) fixed_costs[288 + i] = 5 * 1024;
-            }
-            cm.precomputed_costs = fixed_costs.data();
-            parse_opts.cost_model = cm;
-        }
-        tokens = parser.parse_range(full_data, full_size, start, start + size,
-                                    parse_opts, mf);
-    }
-
+// Encode a fixed-Huffman block from a precomputed token range [begin,end).
+void encode_fixed_tokens(BitWriter& bw,
+                         const std::vector<LZ77Parser::Token>& tokens,
+                         size_t begin, size_t end, bool is_last) {
     bw.write_bits(is_last ? 1 : 0, 1);  // BFINAL
     bw.write_bits(1, 2);                 // BTYPE = fixed Huffman
 
-    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+    for (size_t i = begin; i < end; ++i) {
         auto& t = tokens[i];
         if (t.type == LZ77Parser::Token::LITERAL) {
             auto fc = get_fixed_litlen(t.literal);
@@ -110,72 +74,32 @@ void write_fixed_block(BitWriter& bw, const uint8_t* full_data, size_t full_size
 }
 
 // Encode using dynamic Huffman blocks (BTYPE=2)
-void write_dynamic_block(BitWriter& bw, const uint8_t* full_data, size_t full_size,
-                           size_t start, size_t size, bool is_last,
-                           const DeflateOptions& opts, const MatchFinder* mf) {
-    // Iterative refinement: parse, build Huffman, parse again with costs, repeat
-    LZ77Parser parser;
-    LZ77Parser::Options parse_opts;
-    int iters = std::max(1, opts.iterations);
-    std::vector<LZ77Parser::Token> tokens;
-    std::vector<uint8_t> ll_len, d_len;
-    // Cost model for the DP, built from the previous iteration's actual
-    // Huffman code lengths (Q10 fixed point). Using the real lengths instead
-    // of entropy estimates lets the refinement converge toward the codes the
-    // encoder will actually emit.
-    std::vector<uint16_t> actual_costs;
-
-    for (int iter = 0; iter < iters; ++iter) {
-        if (iter == 0) {
-            parse_opts.optimal = false;
-            // Lazy matching is counterproductive at deep chain depths
-            parse_opts.lazy_matching = true;
-            parse_opts.row_stride = opts.row_stride;
+// Encode a dynamic-Huffman block from a precomputed token range [begin,end).
+// The whole stream is parsed once globally (so matches may span block
+// boundaries); only the Huffman trees are per block.
+void encode_dynamic_tokens(BitWriter& bw,
+                           const std::vector<LZ77Parser::Token>& tokens,
+                           size_t begin, size_t end, bool is_last) {
+    // Count frequencies over this block's tokens.
+    uint32_t ll_freq[deflate::MAX_LITLEN_SYMS] = {};
+    uint32_t d_freq[deflate::MAX_DIST_SYMS] = {};
+    for (size_t i = begin; i < end; ++i) {
+        auto& t = tokens[i];
+        if (t.type == LZ77Parser::Token::LITERAL) {
+            ll_freq[t.literal]++;
         } else {
-            parse_opts.optimal = true;
-            LZ77Parser::CostModel cm;
-            cm.precomputed_costs = actual_costs.data();
-            parse_opts.cost_model = cm;
+            ll_freq[257 + deflate::length_code(t.match_length)]++;
+            d_freq[deflate::distance_code(t.match_distance)]++;
         }
-        tokens = parser.parse_range(full_data, full_size, start, start + size,
-                                    parse_opts, mf);
-
-        // Count frequencies
-        uint32_t ll_freq[deflate::MAX_LITLEN_SYMS] = {};
-        uint32_t d_freq[deflate::MAX_DIST_SYMS] = {};
-        for (size_t i = 0; i + 1 < tokens.size(); ++i) {
-            auto& t = tokens[i];
-            if (t.type == LZ77Parser::Token::LITERAL) {
-                ll_freq[t.literal]++;
-            } else {
-                ll_freq[257 + deflate::length_code(t.match_length)]++;
-                d_freq[deflate::distance_code(t.match_distance)]++;
-            }
-        }
-        ll_freq[deflate::END_OF_BLOCK] = 1;
-
-        // Build Huffman trees (needed for final encoding)
-        ll_len = HuffmanEncoder::compute_lengths(ll_freq, deflate::MAX_LITLEN_SYMS, 15);
-        d_len = HuffmanEncoder::compute_lengths(d_freq, deflate::MAX_DIST_SYMS, 15);
-
-        // Next iteration's cost model: actual code lengths. Unused symbols get
-        // the maximum length so the parser never treats them as free.
-        actual_costs.assign(deflate::MAX_LITLEN_SYMS + deflate::MAX_DIST_SYMS, 0);
-        for (int i = 0; i < deflate::MAX_LITLEN_SYMS; ++i)
-            actual_costs[i] = static_cast<uint16_t>((ll_len[i] ? ll_len[i] : deflate::MAX_BITS) << 10);
-        for (int i = 0; i < deflate::MAX_DIST_SYMS; ++i)
-            actual_costs[deflate::MAX_LITLEN_SYMS + i] =
-                static_cast<uint16_t>((d_len[i] ? d_len[i] : deflate::MAX_BITS) << 10);
     }
+    ll_freq[deflate::END_OF_BLOCK] = 1;
 
-     // Now we have the final tokens and Huffman trees
-    // Edge case: no frequencies
+    auto ll_len = HuffmanEncoder::compute_lengths(ll_freq, deflate::MAX_LITLEN_SYMS, 15);
+    auto d_len = HuffmanEncoder::compute_lengths(d_freq, deflate::MAX_DIST_SYMS, 15);
+
     bool has_any = false;
     for (auto v : ll_len) { if (v > 0) { has_any = true; break; } }
-    if (!has_any) {
-        write_stored_block(bw, full_data + start, size, is_last);
-        return;
-    }
+    if (!has_any) return;
 
     auto ll_code = HuffmanEncoder::lengths_to_codes(ll_len.data(), deflate::MAX_LITLEN_SYMS);
     auto d_code = HuffmanEncoder::lengths_to_codes(d_len.data(), deflate::MAX_DIST_SYMS);
@@ -301,7 +225,7 @@ void write_dynamic_block(BitWriter& bw, const uint8_t* full_data, size_t full_si
     }
 
     // Compressed data
-    for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+    for (size_t i = begin; i < end; ++i) {
         auto& t = tokens[i];
         if (t.type == LZ77Parser::Token::LITERAL) {
             auto& c = ll_code[t.literal];
@@ -354,6 +278,130 @@ uint32_t compute_adler32(const uint8_t* data, size_t len) {
     return (b << 16) | a;
 }
 
+// Choose DEFLATE block boundaries from a tokenization of the whole stream.
+// Unlike a byte-entropy heuristic, this estimates the real encoded cost of
+// each candidate block (Huffman symbol entropy + match extra bits + a tree
+// overhead term) and minimizes the total with a DP. Boundaries can only fall
+// on token boundaries, so matches are never split.
+std::vector<std::pair<size_t, size_t>> token_aware_split(
+    const std::vector<LZ77Parser::Token>& toks, size_t size,
+    size_t min_block, size_t max_block) {
+
+    constexpr size_t LITLEN = deflate::MAX_LITLEN_SYMS; // 288
+    constexpr size_t DIST   = deflate::MAX_DIST_SYMS;   // 32
+    constexpr size_t NSYM   = LITLEN + DIST;
+
+    if (toks.size() < 2) return {{0, toks.empty() ? 0 : toks.size() - 1}};
+    const size_t real = toks.size() - 1; // exclude EOB sentinel
+
+    // Byte offset at each token boundary.
+    std::vector<size_t> off(real + 1, 0);
+    for (size_t i = 0; i < real; ++i) {
+        size_t blen = (toks[i].type == LZ77Parser::Token::LITERAL)
+                          ? 1 : toks[i].match_length;
+        off[i + 1] = off[i] + blen;
+    }
+    if (off[real] != size) return {{0, real}}; // parse mismatch; bail out
+
+    // Candidate boundaries at ~step-byte intervals (capped count).
+    size_t step = 4096;
+    if (size / step > 1024) step = size / 1024;
+    std::vector<size_t> cand;
+    cand.push_back(0);
+    size_t next = step;
+    for (size_t i = 1; i < real; ++i) {
+        if (off[i] >= next) { cand.push_back(i); next = off[i] + step; }
+    }
+    cand.push_back(real);
+    const size_t C = cand.size();
+    if (C < 2) return {{0, real}};
+
+    // Prefix symbol frequencies and extra-bit counts at each candidate.
+    std::vector<std::vector<uint32_t>> pref(C, std::vector<uint32_t>(NSYM, 0));
+    std::vector<uint64_t> extra_pref(C, 0);
+    {
+        std::vector<uint32_t> cur(NSYM, 0);
+        uint64_t extra = 0;
+        size_t ci = 1;
+        for (size_t i = 0; i < real; ++i) {
+            auto& t = toks[i];
+            if (t.type == LZ77Parser::Token::LITERAL) {
+                cur[t.literal]++;
+            } else {
+                int lc = deflate::length_code(t.match_length);
+                int dc = deflate::distance_code(t.match_distance);
+                cur[257 + lc]++;
+                cur[LITLEN + dc]++;
+                extra += deflate::length_extra_bits(lc) +
+                         deflate::distance_extra_bits(dc);
+            }
+            if (ci < C && i + 1 == cand[ci]) {
+                pref[ci] = cur;
+                extra_pref[ci] = extra;
+                ++ci;
+            }
+        }
+    }
+
+    auto block_cost_bits = [&](size_t a, size_t b) -> double {
+        uint32_t ll_freq[LITLEN] = {};
+        uint32_t d_freq[DIST] = {};
+        const auto& pa = pref[a];
+        const auto& pb = pref[b];
+        for (size_t s = 0; s < LITLEN; ++s) ll_freq[s] = pb[s] - pa[s];
+        for (size_t s = 0; s < DIST; ++s) d_freq[s] = pb[LITLEN + s] - pa[LITLEN + s];
+        ll_freq[deflate::END_OF_BLOCK] =
+            std::max(ll_freq[deflate::END_OF_BLOCK], 1u);
+
+        auto ll_len = HuffmanEncoder::compute_lengths(ll_freq, LITLEN, 15);
+        auto d_len = HuffmanEncoder::compute_lengths(d_freq, DIST, 15);
+        double bits = 0;
+        int active = 0;
+        for (size_t s = 0; s < LITLEN; ++s) {
+            bits += static_cast<double>(ll_freq[s]) * ll_len[s];
+            if (ll_len[s]) ++active;
+        }
+        for (size_t s = 0; s < DIST; ++s) {
+            bits += static_cast<double>(d_freq[s]) * d_len[s];
+            if (d_len[s]) ++active;
+        }
+        bits += static_cast<double>(extra_pref[b] - extra_pref[a]);
+        // Dynamic header + code-length tree overhead approximation.
+        bits += 60.0 + 6.0 * active;
+        return bits;
+    };
+
+    const double INF = std::numeric_limits<double>::infinity();
+    std::vector<double> best(C, INF);
+    std::vector<int> prev(C, -1);
+    best[0] = 0;
+    for (size_t j = 1; j < C; ++j) {
+        for (size_t i = j; i-- > 0;) {
+            size_t seg = off[cand[j]] - off[cand[i]];
+            if (seg < min_block) continue;
+            if (seg > max_block) break;
+            if (best[i] == INF) continue;
+            double c = best[i] + block_cost_bits(i, j);
+            if (c < best[j]) { best[j] = c; prev[j] = static_cast<int>(i); }
+        }
+    }
+
+    std::vector<size_t> cuts; // token indices
+    int idx = static_cast<int>(C - 1);
+    while (idx > 0 && prev[idx] >= 0) {
+        cuts.push_back(cand[idx]);
+        idx = prev[idx];
+    }
+    cuts.push_back(0);
+    std::reverse(cuts.begin(), cuts.end());
+
+    std::vector<std::pair<size_t, size_t>> ranges;
+    for (size_t i = 0; i + 1 < cuts.size(); ++i)
+        ranges.push_back({cuts[i], cuts[i + 1]});
+    if (ranges.empty()) ranges.push_back({0, real});
+    return ranges;
+}
+
 } // anonymous namespace
 
 std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
@@ -379,22 +427,13 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
         return out;
     }
 
-    // Auto-scale: for large images (>=128K bytes filtered), use 8192-byte
-    // blocks to specialize Huffman trees per data region. For smaller
-    // images, use a single 65536-byte block to minimize tree overhead.
-    // Never exceed 65535 so every block remains eligible for a stored block.
+    // Auto-scale: a single 65535-byte block minimizes tree overhead; larger
+    // streams are split where the estimated Huffman cost actually drops.
     size_t eff_block_size = opts.max_block_size;
     if (eff_block_size == 0) {
         eff_block_size = 65535;
     }
     eff_block_size = std::min(eff_block_size, size_t(65535));
-    auto blocks = opts.adaptive_blocks
-        ? BlockSplitter::split_greedy_adaptive(data.data(), data.size(),
-                                                4096, eff_block_size)
-        : BlockSplitter::split(data.data(), data.size(), eff_block_size);
-
-    if (blocks.empty())
-        blocks.push_back({0, data.size()});
 
     // Version with explicit opts
     DeflateOptions adjusted = opts;
@@ -417,25 +456,102 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
     shared_mf.row_stride = adjusted.row_stride;
     shared_mf.init(data.data(), data.size());
 
-    for (size_t bi = 0; bi < blocks.size(); ++bi) {
-        auto& b = blocks[bi];
-        bool is_last = (bi == blocks.size() - 1);
-        size_t block_size = b.end_offset - b.start_offset;
+    // Global tokenization with iterative refinement. Parsing the whole stream
+    // once (instead of per block) lets matches span block boundaries; only the
+    // Huffman trees are per block.
+    std::vector<LZ77Parser::Token> tokens;
+    {
+        LZ77Parser parser;
+        LZ77Parser::Options popts;
+        popts.min_match = deflate::MIN_MATCH_LEN;
+        popts.lazy_matching = true;
+        popts.row_stride = adjusted.row_stride;
+        int iters = std::max(1, adjusted.iterations);
+        std::vector<uint8_t> ll_len, d_len;
+        std::vector<uint16_t> actual_costs;
+        for (int iter = 0; iter < iters; ++iter) {
+            if (iter == 0) {
+                popts.optimal = false;
+            } else {
+                popts.optimal = true;
+                LZ77Parser::CostModel cm;
+                cm.precomputed_costs = actual_costs.data();
+                popts.cost_model = cm;
+            }
+            tokens = parser.parse_range(data.data(), data.size(), 0, data.size(),
+                                        popts, &shared_mf);
 
-        // Short blocks: dynamic Huffman overhead exceeds savings.
-        // Use stored for very small blocks (<256), but for blocks 256-512,
-        // check byte entropy: low entropy means dynamic Huffman wins despite
-        // tree overhead (a block of all-zeros compresses to ~15 bytes stored
-        // but could be ~10 bytes dynamic).
+            uint32_t ll_freq[deflate::MAX_LITLEN_SYMS] = {};
+            uint32_t d_freq[deflate::MAX_DIST_SYMS] = {};
+            for (size_t i = 0; i + 1 < tokens.size(); ++i) {
+                auto& t = tokens[i];
+                if (t.type == LZ77Parser::Token::LITERAL) {
+                    ll_freq[t.literal]++;
+                } else {
+                    ll_freq[257 + deflate::length_code(t.match_length)]++;
+                    d_freq[deflate::distance_code(t.match_distance)]++;
+                }
+            }
+            ll_freq[deflate::END_OF_BLOCK] = 1;
+            ll_len = HuffmanEncoder::compute_lengths(ll_freq, deflate::MAX_LITLEN_SYMS, 15);
+            d_len = HuffmanEncoder::compute_lengths(d_freq, deflate::MAX_DIST_SYMS, 15);
+            actual_costs.assign(deflate::MAX_LITLEN_SYMS + deflate::MAX_DIST_SYMS, 0);
+            for (int s = 0; s < deflate::MAX_LITLEN_SYMS; ++s)
+                actual_costs[s] = static_cast<uint16_t>(
+                    (ll_len[s] ? ll_len[s] : deflate::MAX_BITS) << 10);
+            for (int s = 0; s < deflate::MAX_DIST_SYMS; ++s)
+                actual_costs[deflate::MAX_LITLEN_SYMS + s] = static_cast<uint16_t>(
+                    (d_len[s] ? d_len[s] : deflate::MAX_BITS) << 10);
+        }
+    }
+
+    const size_t real = tokens.empty() ? 0 : tokens.size() - 1; // exclude EOB
+    // Byte offset at each token boundary (used for stored-block sizing).
+    std::vector<size_t> off(real + 1, 0);
+    for (size_t i = 0; i < real; ++i)
+        off[i + 1] = off[i] + ((tokens[i].type == LZ77Parser::Token::LITERAL)
+                                   ? 1 : tokens[i].match_length);
+
+    // Choose token ranges (blocks).
+    std::vector<std::pair<size_t, size_t>> ranges;
+    if (opts.adaptive_blocks) {
+        ranges = token_aware_split(tokens, data.size(), 4096, eff_block_size);
+    } else {
+        auto bblocks = BlockSplitter::split(data.data(), data.size(), eff_block_size);
+        size_t ti = 0;
+        for (auto& b : bblocks) {
+            size_t tb = ti;
+            while (ti < real && off[ti] < b.end_offset) ++ti;
+            ranges.push_back({tb, ti});
+        }
+        if (ranges.empty()) ranges.push_back({0, real});
+        ranges.back().second = real;
+    }
+
+    // Drop empty ranges so is_last lands on a real block.
+    std::vector<std::pair<size_t, size_t>> emit;
+    for (auto& r : ranges)
+        if (r.second > r.first) emit.push_back(r);
+
+    for (size_t ri = 0; ri < emit.size(); ++ri) {
+        size_t tb = emit[ri].first;
+        size_t te = emit[ri].second;
+        bool is_last = (ri == emit.size() - 1);
+        size_t start = (tb < off.size()) ? off[tb] : data.size();
+        size_t endb = (te < off.size()) ? off[te] : data.size();
+        size_t block_size = endb - start;
+
+        // Short blocks: dynamic Huffman overhead exceeds savings. Use stored
+        // for very small blocks, or for 256-512 byte blocks whose byte entropy
+        // is high (incompressible).
         bool use_stored = false;
         if (adjusted.level < CompressionLevel::Ultra) {
             if (block_size < 256) {
                 use_stored = true;
             } else if (block_size < 512) {
-                // Compute byte entropy; if data is highly repetitive, try dynamic
                 uint32_t freq[256] = {};
-                for (size_t i = 0; i < block_size; ++i)
-                    freq[data[b.start_offset + i]]++;
+                for (size_t i = start; i < endb; ++i)
+                    freq[data[i]]++;
                 double ent = 0;
                 double inv = 1.0 / block_size;
                 for (int i = 0; i < 256; ++i) {
@@ -444,22 +560,16 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
                         ent -= p * std::log2(p);
                     }
                 }
-                // Entropy < 3 bits/byte → data is compressible enough to justify tree overhead
                 use_stored = (ent >= 3.0);
             }
         }
 
         if (use_stored)
-            write_stored_block(bw, data.data() + b.start_offset, block_size,
-                               is_last);
+            write_stored_block(bw, data.data() + start, block_size, is_last);
         else if (adjusted.level >= CompressionLevel::Default)
-            write_dynamic_block(bw, data.data(), data.size(),
-                                b.start_offset, block_size,
-                                is_last, adjusted, &shared_mf);
+            encode_dynamic_tokens(bw, tokens, tb, te, is_last);
         else
-            write_fixed_block(bw, data.data(), data.size(),
-                              b.start_offset, block_size,
-                              is_last, adjusted, &shared_mf);
+            encode_fixed_tokens(bw, tokens, tb, te, is_last);
     }
 
     bw.flush_to_byte();
