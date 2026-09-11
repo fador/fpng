@@ -225,9 +225,10 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
     if ((int)filtered.size() > max_filtered)
         filtered.resize(max_filtered);
 
-    // Force-include one GA strategy for large images (it was sorted to the end
-    // by cost and would be cut by max_filtered, but filter quality matters).
-    if (is_large && !is_huge) {
+    // Force-include one GA strategy for large/huge images (it was sorted to
+    // the end by cost and would be cut by max_filtered, but filter quality
+    // matters most for photographic content).
+    if (is_large || is_huge) {
         bool has_ga = false;
         for (auto& f : filtered) {
             if (f.filter_level >= 5) { has_ga = true; break; }
@@ -388,7 +389,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         // (its Fixed-Huffman proxy rank underrates it — Dynamic Huffman
         //  benefits much more from GA-chosen filters)
         size_t ga_idx = std::numeric_limits<size_t>::max();
-        if (is_large && !is_huge) {
+        if (is_large || is_huge) {
             for (size_t si = 0; si < sorted.size(); ++si) {
                 if (sorted[si].strategy.filter_level >= 5) {
                     ga_idx = si;
@@ -576,8 +577,9 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
         // Per-row filter selection (MinSum/entropy/GA) can miss globally-optimal
         // uniform filters because per-row fitness doesn't account for cross-row
         // pattern consistency that LZ77 exploits. Try all 5 uniform filter sets
-        // with the best strategy's parameters as a refinement pass.
-        if (!is_huge) {
+        // with the best strategy's parameters as a refinement pass. This runs
+        // for huge images too — uniform Paeth/Up frequently wins on photos.
+        {
             // Use best-result-winning parameters but try uniform filter sets
             // with both alpha_zero on and off for images that have alpha.
             Strategy ref = sorted[0].strategy;
@@ -604,9 +606,9 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
                 DeflateOptions d;
                 d.level = ref.deflate_level;
-                d.iterations = is_huge ? 1 :
+                d.iterations = is_huge ? 2 :
                     (is_large ? std::min(ref.deflate_iterations, 2) : ref.deflate_iterations);
-                d.adaptive_blocks = !is_huge && !is_large;
+                d.adaptive_blocks = true;
                 d.chain_depth = 0;
 
                 WriteOptions w;

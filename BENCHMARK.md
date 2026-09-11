@@ -181,9 +181,9 @@ Subsequent compression improvements:
   24–43%; `WriteOptions::interlace` retains the old behavior.
 - **Large/huge images no longer starved of effort.** The huge path was limited
   to entropy filters, no GA, a single re-compress candidate and one deflate
-  iteration. It now allows one GA strategy, 2–3 optimal-parse iterations and
-  two re-compress candidates, while the large path is unchanged. On four Kodak
-  photos (768×512): total 2,906,623 → 2,813,200 B (−3.2%) and all now beat the
+  iteration. It now allows a GA/hill-climb strategy, 2–3 optimal-parse
+  iterations, two re-compress candidates and the uniform-filter polish. On four
+  Kodak photos (768×512): 2,906,623 → 2,806,285 B (−3.5%) and all now beat the
   originals by 2–5% (e.g. `kodim23` 580,308 → 544,970).
 
 Measured on the bundled corpus (223 images, `-o9 -j4`):
