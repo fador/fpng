@@ -70,7 +70,14 @@ void PNGWriter::write_plte(std::vector<uint8_t>& out, const Image& img) {
 void PNGWriter::write_trns(std::vector<uint8_t>& out, const Image& img) {
     if (img.color_type == 3) {
         if (!img.alpha_palette.empty()) {
-            write_chunk(out, "tRNS", img.alpha_palette);
+            // PNG allows a tRNS shorter than the palette: trailing entries
+            // default to opaque (255). Trim them to save raw chunk bytes.
+            size_t n = img.alpha_palette.size();
+            while (n > 0 && img.alpha_palette[n - 1] == 255) --n;
+            if (n > 0) {
+                write_chunk(out, "tRNS",
+                            {img.alpha_palette.data(), n});
+            }
         }
     } else if (!img.ancillary.tRNS.empty()) {
         write_chunk(out, "tRNS", img.ancillary.tRNS);

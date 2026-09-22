@@ -22,7 +22,16 @@ void sort_palette(Image& img) {
         lum.push_back({l, i});
     }
 
-    std::sort(lum.begin(), lum.end());
+    std::sort(lum.begin(), lum.end(), [&](const std::pair<double, size_t>& a,
+                                          const std::pair<double, size_t>& b) {
+        // Opaque entries last so trailing 255-trim can shorten tRNS.
+        uint8_t aa = (a.second < img.alpha_palette.size()) ? img.alpha_palette[a.second] : 255;
+        uint8_t bb = (b.second < img.alpha_palette.size()) ? img.alpha_palette[b.second] : 255;
+        int ka = (aa == 255) ? 1 : 0;
+        int kb = (bb == 255) ? 1 : 0;
+        if (ka != kb) return ka < kb;
+        return a.first < b.first;
+    });
 
     // Build permutation
     std::vector<uint8_t> perm(num_colors);

@@ -92,20 +92,61 @@ void reduce_colors(Image& img) {
 
         if (!too_many) {
             size_t count = colors.size();
+            // Order palette: fully-transparent first, then semi-transparent,
+            // then fully-opaque last. PNG allows a shorter tRNS (missing
+            // trailing entries default to opaque 255), so placing opaque
+            // entries last lets write_trns trim the trailing 255s.
+            std::vector<uint32_t> ordered;
+            ordered.reserve(count);
+            for (size_t i = 0; i < count; ++i)
+                if ((colors[i] & 0xffu) == 0u) ordered.push_back(colors[i]);
+            for (size_t i = 0; i < count; ++i) {
+                uint8_t a = static_cast<uint8_t>(colors[i] & 0xffu);
+                if (a != 255 && a != 0) ordered.push_back(colors[i]);
+            }
+            for (size_t i = 0; i < count; ++i)
+                if ((colors[i] & 0xffu) == 255u) ordered.push_back(colors[i]);
+
+            // Build old->new index map and remap pixels below.
+            std::vector<uint8_t> remap(count);
+            for (size_t i = 0; i < count; ++i) {
+                uint32_t key = colors[i];
+                for (size_t j = 0; j < count; ++j) {
+                    if (ordered[j] == key) { remap[i] = static_cast<uint8_t>(j); break; }
+                }
+            }
+
             img.palette.resize(count * 3);
             img.alpha_palette.clear();
             bool need_alpha = false;
             for (size_t i = 0; i < count; ++i) {
-                uint32_t c = colors[i];
+                uint32_t c = ordered[i];
                 uint8_t r = static_cast<uint8_t>((c >> 24) & 0xff);
                 uint8_t g = static_cast<uint8_t>((c >> 16) & 0xff);
                 uint8_t b = static_cast<uint8_t>((c >> 8) & 0xff);
                 uint8_t a = static_cast<uint8_t>(c & 0xff);
+                // Zero RGB of fully-transparent entries (never displayed).
+                if (a == 0) { r = g = b = 0; }
                 img.palette[i * 3 + 0] = r;
                 img.palette[i * 3 + 1] = g;
                 img.palette[i * 3 + 2] = b;
                 if (a < 255) need_alpha = true;
                 img.alpha_palette.push_back(a);
+            }
+
+            // Remap the index_of lookup so pixel packing below uses new indices.
+            for (auto& kv : index_of) {
+                // kv.second is the old index; find its new index via remap.
+                // We need the old key; rebuild from colors[old].
+                (void)kv;
+            }
+            // Rebuild index_of with new indices (keys are unchanged).
+            {
+                std::unordered_map<uint32_t, uint8_t> new_index;
+                new_index.reserve(index_of.size());
+                for (size_t i = 0; i < count; ++i)
+                    new_index.emplace(ordered[i], static_cast<uint8_t>(i));
+                index_of = std::move(new_index);
             }
 
             uint8_t bd = (count <= 2) ? 1 : (count <= 4) ? 2 : (count <= 16) ? 4 : 8;

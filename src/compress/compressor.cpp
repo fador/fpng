@@ -281,7 +281,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
     auto run_one_trial = [&](const Strategy& s) -> TrialResult {
         Image work = img;
-        if (s.alpha_zero && (img.color_type == 6 || img.color_type == 4))
+        if (s.alpha_zero && (img.color_type == 6 || img.color_type == 4 || img.color_type == 3))
             alpha_optimize(work);
         if (s.color_reduce)
             reduce_colors(work);
@@ -406,7 +406,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
             auto& strat = sorted[ri].strategy;
 
             Image work = img;
-            if (strat.alpha_zero && (img.color_type == 6 || img.color_type == 4))
+            if (strat.alpha_zero && (img.color_type == 6 || img.color_type == 4 || img.color_type == 3))
                 alpha_optimize(work);
             if (strat.color_reduce) reduce_colors(work);
             if (strat.palette_sort) sort_palette(work);
@@ -534,7 +534,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
                 if (changes > 2) continue;
 
                 Image work = img;
-                if (h.az && (img.color_type == 6 || img.color_type == 4))
+                if (h.az && (img.color_type == 6 || img.color_type == 4 || img.color_type == 3))
                     alpha_optimize(work);
                 if (h.cr) reduce_colors(work);
                 if (h.ps) sort_palette(work);
@@ -600,7 +600,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
                 for (auto ft : uniform_types) {
                     Image work = img;
-                    if (use_alpha && (img.color_type == 6 || img.color_type == 4))
+                    if (use_alpha && (img.color_type == 6 || img.color_type == 4 || img.color_type == 3))
                         alpha_optimize(work);
                     if (ref.color_reduce) reduce_colors(work);
                     if (ref.palette_sort) sort_palette(work);
@@ -653,7 +653,7 @@ CompressResult compress(const Image& img, const CompressOptions& opts) {
 
     // Need to re-filter since the writer auto-computes
     Image work2 = img;
-    if (best_strat.alpha_zero && (img.color_type == 6 || img.color_type == 4))
+    if (best_strat.alpha_zero && (img.color_type == 6 || img.color_type == 4 || img.color_type == 3))
         alpha_optimize(work2);
     if (best_strat.palette_sort)
         sort_palette(work2);
