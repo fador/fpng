@@ -110,93 +110,163 @@ void encode_dynamic_tokens(BitWriter& bw,
     int hdist = 30;
     while (hdist > 1 && d_len[hdist - 1] == 0) --hdist;
 
-    // Step 4-5: Build CLEN tree from the code-length frequencies directly.
-    std::vector<uint8_t> tree_rle;
-    uint32_t clen_freq[deflate::MAX_CLEN_SYMS] = {};
-    for (int i = 0; i < hlit; ++i) clen_freq[ll_len[i]]++;
-    for (int i = 0; i < hdist; ++i) clen_freq[d_len[i]]++;
-    clen_freq[16] = std::max(clen_freq[16], 1u);
-    clen_freq[17] = std::max(clen_freq[17], 1u);
-    clen_freq[18] = std::max(clen_freq[18], 1u);
+    // Step 4-5: Encode the two code-length arrays with RLE + a CLEN tree.
+    // Use DP-optimal segmentation (replaces greedy thresholds) and iterate
+    // the RLE <-> CLEN-tree loop so the tree is tuned for the actual RLE
+    // stream it will encode.  No forced minimum on CLEN symbols 16/17/18 -
+    // unused RLE codes cost zero header bits.
+    auto rle_encode = [&](const uint8_t* lengths, int count,
+                          const int cost[19]) -> std::vector<uint8_t> {
+        // cost[c] = CLEN code length for symbol c (extra-bit widths are fixed).
+        std::vector<uint8_t> out;
+        out.reserve(count);
 
-    auto clen_len = HuffmanEncoder::compute_lengths(clen_freq, deflate::MAX_CLEN_SYMS, 7);
-    auto clen_code = HuffmanEncoder::lengths_to_codes(clen_len.data(), deflate::MAX_CLEN_SYMS);
-    int hclen = 19;
-    while (hclen > 4 && clen_len[deflate::CLEN_ORDER[hclen - 1]] == 0)
-        --hclen;
-
-    // Re-encode tree RLE with optimal thresholds using actual CLEN costs.
-    auto optimal_rle = [&](const uint8_t* lengths, int count) {
-            int i = 0;
-            while (i < count) {
-                uint8_t len = lengths[i];
-                if (len == 0) {
-                    int run = 0;
-                    while (i + run < count && lengths[i + run] == 0) ++run;
-
-                    // Compute costs for each encoding choice
-                    int cost_individual = run * clen_len[0];                // individual zeros
-                    int cost_17 = clen_len[17] + 3;                          // repeat 3-10
-                    int cost_18 = clen_len[18] + 7;                          // repeat 11-138
-
-                    // Greedy optimal: pick cheapest for each segment
-                    int processed = 0;
-                    while (processed < run) {
-                        int remaining = run - processed;
-                        if (remaining >= 11 && cost_18 <= cost_individual * std::min(remaining, 138)) {
-                            int n = std::min(remaining, 138);
-                            tree_rle.push_back(18);
-                            tree_rle.push_back(static_cast<uint8_t>(n - 11));
-                            processed += n;
-                        } else if (remaining >= 3 && cost_17 <= cost_individual * std::min(remaining, 10)) {
-                            int n = std::min(remaining, 10);
-                            tree_rle.push_back(17);
-                            tree_rle.push_back(static_cast<uint8_t>(n - 3));
-                            processed += n;
-                        } else {
-                            tree_rle.push_back(0);
-                            processed++;
-                        }
-                    }
-                    i += run;
+        // DP over zero-runs: cover k zeros with individual 0s (cost[0] each),
+        // code-17 (3-10 zeros, cost[17]+3), or code-18 (11-138 zeros, cost[18]+7).
+        auto dp_zeros = [&](int run, std::vector<uint8_t>& emit) {
+            std::vector<int> dp(run + 1, INT_MAX);
+            std::vector<uint8_t> choice(run + 1, 0); // 1 = single, 2 = code17, 3 = code18
+            std::vector<uint8_t> span(run + 1, 0);
+            dp[0] = 0;
+            for (int j = 1; j <= run; ++j) {
+                if (dp[j - 1] != INT_MAX && dp[j - 1] + cost[0] < dp[j]) {
+                    dp[j] = dp[j - 1] + cost[0]; choice[j] = 1; span[j] = 1;
+                }
+                for (int k = 3; k <= 10 && k <= j; ++k) {
+                    if (dp[j - k] == INT_MAX) continue;
+                    int c = dp[j - k] + cost[17] + 3;
+                    if (c < dp[j]) { dp[j] = c; choice[j] = 2; span[j] = k; }
+                }
+                for (int k = 11; k <= 138 && k <= j; ++k) {
+                    if (dp[j - k] == INT_MAX) continue;
+                    int c = dp[j - k] + cost[18] + 7;
+                    if (c < dp[j]) { dp[j] = c; choice[j] = 3; span[j] = k; }
+                }
+            }
+            // Backtrack into temporary buffer, then reverse-emit.
+            struct Seg { uint8_t code; uint8_t count; };
+            std::vector<Seg> segs;
+            int pos = run;
+            while (pos > 0) {
+                segs.push_back({choice[pos], span[pos]});
+                pos -= span[pos];
+            }
+            for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+                if (it->code == 1) { emit.push_back(0); }
+                else if (it->code == 2) {
+                    emit.push_back(17);
+                    emit.push_back(static_cast<uint8_t>(it->count - 3));
                 } else {
-                    tree_rle.push_back(len);
-                    ++i;
-                    int run = 0;
-                    while (i + run < count && lengths[i + run] == len) ++run;
-                    if (run >= 3) {
-                        // Code 16: repeat previous length 3-6 times
-                        int cost_16 = clen_len[16] + 2;
-                        int n = std::min(run, 6);
-                        if (cost_16 <= n * clen_len[len]) {
-                            tree_rle.push_back(16);
-                            tree_rle.push_back(static_cast<uint8_t>(n - 3));
-                            i += n;
-                        }
-                    }
+                    emit.push_back(18);
+                    emit.push_back(static_cast<uint8_t>(it->count - 11));
                 }
             }
         };
 
-    // Rebuild tree_rle with optimal encoding
-    tree_rle.clear();
-    optimal_rle(ll_len.data(), hlit);
-    optimal_rle(d_len.data(), hdist);
+        // DP over nonzero runs: emit one literal, then cover the remainder
+        // with individual codes (cost[len] each) or code-16 (3-6 copies,
+        // cost[16]+2).  Code 16 chains (repeats the run's value).
+        auto dp_repeat = [&](uint8_t len, int run, std::vector<uint8_t>& emit) {
+            emit.push_back(len);
+            int rem = run - 1;
+            if (rem <= 0) return;
+            std::vector<int> dp(rem + 1, INT_MAX);
+            std::vector<uint8_t> choice(rem + 1, 0); // 1 = single, 2 = code16
+            std::vector<uint8_t> span(rem + 1, 0);
+            dp[0] = 0;
+            for (int j = 1; j <= rem; ++j) {
+                if (dp[j - 1] != INT_MAX && dp[j - 1] + cost[len] < dp[j]) {
+                    dp[j] = dp[j - 1] + cost[len]; choice[j] = 1; span[j] = 1;
+                }
+                for (int k = 3; k <= 6 && k <= j; ++k) {
+                    if (dp[j - k] == INT_MAX) continue;
+                    int c = dp[j - k] + cost[16] + 2;
+                    if (c < dp[j]) { dp[j] = c; choice[j] = 2; span[j] = k; }
+                }
+            }
+            struct Seg { uint8_t code; uint8_t count; };
+            std::vector<Seg> segs;
+            int pos = rem;
+            while (pos > 0) {
+                segs.push_back({choice[pos], span[pos]});
+                pos -= span[pos];
+            }
+            for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+                if (it->code == 1) emit.push_back(len);
+                else {
+                    emit.push_back(16);
+                    emit.push_back(static_cast<uint8_t>(it->count - 3));
+                }
+            }
+        };
 
-    // Recompute CLEN frequencies from optimized RLE
-    std::memset(clen_freq, 0, sizeof(clen_freq));
-    for (size_t i = 0; i < tree_rle.size(); ++i) {
-        uint8_t v = tree_rle[i];
-        if (v < 16) clen_freq[v]++;
-        else { clen_freq[v]++; i++; }
+        int i = 0;
+        while (i < count) {
+            uint8_t len = lengths[i];
+            int run = 1;
+            while (i + run < count && lengths[i + run] == len) ++run;
+            if (len == 0) dp_zeros(run, out);
+            else          dp_repeat(len, run, out);
+            i += run;
+        }
+        return out;
+    };
+
+    // Compute total CLEN-stream cost (code bits + extra bits) for a tree_rle.
+    auto rle_stream_cost = [&](const std::vector<uint8_t>& rle,
+                               const uint8_t cl[19]) -> int {
+        int total = 0;
+        for (size_t i = 0; i < rle.size(); ++i) {
+            uint8_t v = rle[i];
+            total += cl[v];
+            if (v == 16)      { total += 2; ++i; }
+            else if (v == 17) { total += 3; ++i; }
+            else if (v == 18) { total += 7; ++i; }
+        }
+        return total;
+    };
+
+    // Iterate RLE <-> CLEN-tree to a fixpoint (max 4 rounds, keep best).
+    std::vector<uint8_t> tree_rle;
+    std::vector<uint8_t> best_rle;
+    int best_cost = INT_MAX;
+    uint32_t clen_freq[deflate::MAX_CLEN_SYMS] = {};
+    uint32_t best_clen_freq[deflate::MAX_CLEN_SYMS] = {};
+    int cost[19];
+    for (int c = 0; c < 19; ++c) cost[c] = 5; // uniform prior for first pass
+
+    for (int round = 0; round < 4; ++round) {
+        std::vector<uint8_t> rle;
+        rle.reserve(hlit + hdist);
+        auto part = rle_encode(ll_len.data(), hlit, cost);
+        rle.insert(rle.end(), part.begin(), part.end());
+        part = rle_encode(d_len.data(), hdist, cost);
+        rle.insert(rle.end(), part.begin(), part.end());
+
+        // Count frequencies from RLE output (no forced minimums).
+        std::memset(clen_freq, 0, sizeof(clen_freq));
+        for (size_t i = 0; i < rle.size(); ++i) {
+            uint8_t v = rle[i];
+            clen_freq[v]++;
+            if (v >= 16) ++i; // skip extra-byte
+        }
+
+        auto cl = HuffmanEncoder::compute_lengths(clen_freq, deflate::MAX_CLEN_SYMS, 7);
+        int sc = rle_stream_cost(rle, cl.data());
+        if (sc < best_cost) {
+            best_cost = sc;
+            best_rle = rle;
+            std::memcpy(best_clen_freq, clen_freq, sizeof(clen_freq));
+        }
+        // Re-cost for next round using the freshly built tree.
+        for (int c = 0; c < 19; ++c) cost[c] = cl[c] ? cl[c] : 1;
     }
 
-    // Rebuild CLEN tree with new frequencies
-    clen_len = HuffmanEncoder::compute_lengths(clen_freq, deflate::MAX_CLEN_SYMS, 7);
-    clen_code = HuffmanEncoder::lengths_to_codes(clen_len.data(), deflate::MAX_CLEN_SYMS);
-
-    // Recompute HCLEN
-    hclen = 19;
+    tree_rle = std::move(best_rle);
+    std::memcpy(clen_freq, best_clen_freq, sizeof(clen_freq));
+    auto clen_len = HuffmanEncoder::compute_lengths(clen_freq, deflate::MAX_CLEN_SYMS, 7);
+    auto clen_code = HuffmanEncoder::lengths_to_codes(clen_len.data(), deflate::MAX_CLEN_SYMS);
+    int hclen = 19;
     while (hclen > 4 && clen_len[deflate::CLEN_ORDER[hclen - 1]] == 0)
         --hclen;
 
