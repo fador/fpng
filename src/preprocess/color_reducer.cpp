@@ -7,17 +7,28 @@
 namespace fpng {
 
 void reduce_colors(Image& img) {
-    // --- 16-bit -> 8-bit when the high byte of every sample is zero ---
+    // --- 16-bit -> 8-bit when samples were scaled (high == low) or zero-extended (high == 0) ---
     if (img.color_type != 3 && img.bit_depth == 16) {
         size_t n = img.pixels.size();
-        bool can_reduce = (n % 2 == 0);
-        for (size_t i = 0; i + 1 < n && can_reduce; i += 2)
-            if (img.pixels[i + 1] != 0) can_reduce = false;
-        if (can_reduce) {
+        bool can_reduce_equal = (n % 2 == 0);
+        bool can_reduce_zero_hi = (n % 2 == 0);
+        for (size_t i = 0; i + 1 < n; i += 2) {
+            if (img.pixels[i] != img.pixels[i + 1]) can_reduce_equal = false;
+            if (img.pixels[i] != 0) can_reduce_zero_hi = false;
+            if (!can_reduce_equal && !can_reduce_zero_hi) break;
+        }
+        if (can_reduce_equal) {
             std::vector<uint8_t> new_pixels;
             new_pixels.reserve(n / 2);
             for (size_t i = 0; i < n; i += 2)
                 new_pixels.push_back(img.pixels[i]);
+            img.pixels = std::move(new_pixels);
+            img.bit_depth = 8;
+        } else if (can_reduce_zero_hi) {
+            std::vector<uint8_t> new_pixels;
+            new_pixels.reserve(n / 2);
+            for (size_t i = 0; i < n; i += 2)
+                new_pixels.push_back(img.pixels[i + 1]);
             img.pixels = std::move(new_pixels);
             img.bit_depth = 8;
         }

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <vector>
 #include <limits>
+#include <climits>
 
 namespace fpng {
 
@@ -565,13 +566,31 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
             ll_freq[deflate::END_OF_BLOCK] = 1;
             ll_len = HuffmanEncoder::compute_lengths(ll_freq, deflate::MAX_LITLEN_SYMS, 15);
             d_len = HuffmanEncoder::compute_lengths(d_freq, deflate::MAX_DIST_SYMS, 15);
+            uint32_t total_ll = 0;
+            for (int s = 0; s < deflate::MAX_LITLEN_SYMS; ++s) total_ll += ll_freq[s];
+            uint32_t total_d = 0;
+            for (int s = 0; s < deflate::MAX_DIST_SYMS; ++s) total_d += d_freq[s];
+            if (total_d == 0) total_d = 1;
+
             actual_costs.assign(deflate::MAX_LITLEN_SYMS + deflate::MAX_DIST_SYMS, 0);
-            for (int s = 0; s < deflate::MAX_LITLEN_SYMS; ++s)
-                actual_costs[s] = static_cast<uint16_t>(
-                    (ll_len[s] ? ll_len[s] : deflate::MAX_BITS) << 10);
-            for (int s = 0; s < deflate::MAX_DIST_SYMS; ++s)
-                actual_costs[deflate::MAX_LITLEN_SYMS + s] = static_cast<uint16_t>(
-                    (d_len[s] ? d_len[s] : deflate::MAX_BITS) << 10);
+            for (int s = 0; s < deflate::MAX_LITLEN_SYMS; ++s) {
+                if (ll_freq[s] > 0) {
+                    double bits = -std::log2(static_cast<double>(ll_freq[s]) / total_ll);
+                    actual_costs[s] = static_cast<uint16_t>(std::clamp(bits * 1024.0, 1024.0, 15.0 * 1024.0));
+                } else {
+                    double bits = std::log2(total_ll * 2.0);
+                    actual_costs[s] = static_cast<uint16_t>(std::clamp(bits * 1024.0, 1024.0, 15.0 * 1024.0));
+                }
+            }
+            for (int s = 0; s < deflate::MAX_DIST_SYMS; ++s) {
+                if (d_freq[s] > 0) {
+                    double bits = -std::log2(static_cast<double>(d_freq[s]) / total_d);
+                    actual_costs[deflate::MAX_LITLEN_SYMS + s] = static_cast<uint16_t>(std::clamp(bits * 1024.0, 1024.0, 15.0 * 1024.0));
+                } else {
+                    double bits = std::log2(total_d * 2.0);
+                    actual_costs[deflate::MAX_LITLEN_SYMS + s] = static_cast<uint16_t>(std::clamp(bits * 1024.0, 1024.0, 15.0 * 1024.0));
+                }
+            }
         }
     }
 

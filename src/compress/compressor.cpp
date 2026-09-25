@@ -139,25 +139,24 @@ CompressResult compress_single(const Image& img, const CompressOptions& opts) {
     Timer t;
 
     Image work = img;
-    // Don't pre-process - preserve constant channels for filter efficiency
+    if (work.color_type == 6 || work.color_type == 4 || work.color_type == 3)
+        alpha_optimize(work);
+    reduce_colors(work);
+    if (work.color_type == 3)
+        sort_palette(work);
 
-    auto strats = get_strategies(std::min(opts.level, 6));
-    Strategy s = strats[0];
-    if (opts.level >= 9 && strats.size() > 3) s = strats[3];
-
-    // Re-apply strategy-specific pre-processing
-    if (s.alpha_zero) alpha_optimize(work);
-    if (s.color_reduce) reduce_colors(work);
-    if (s.palette_sort) sort_palette(work);
-
+    size_t raw_ss = work.raw_scanline_size();
     FilterOptions fopts;
-    fopts.level = s.filter_level;
-    fopts.window_size = std::min(3, s.filter_level);
+    fopts.level = opts.level >= 7 ? 7 : (opts.level >= 5 ? 5 : (opts.level >= 3 ? 3 : 2));
+    fopts.window_size = std::min(3, fopts.level);
     auto filters = optimize_filters(work, fopts);
 
     DeflateOptions dopts;
-    dopts.level = s.deflate_level;
-    dopts.iterations = s.deflate_iterations;
+    dopts.level = opts.level >= 9 ? CompressionLevel::Ultra :
+                  (opts.level >= 5 ? CompressionLevel::Best : CompressionLevel::Default);
+    dopts.iterations = opts.level >= 9 ? 3 : (opts.level >= 5 ? 2 : 1);
+    dopts.row_stride = static_cast<int>(raw_ss + 1);
+    dopts.adaptive_blocks = true;
 
     WriteOptions wopts;
     wopts.filters = filters;
@@ -165,12 +164,28 @@ CompressResult compress_single(const Image& img, const CompressOptions& opts) {
 
     PNGWriter writer;
     auto png_out = writer.write(work, wopts);
+    std::string best_strat = "single-viterbi";
+
+    if (opts.level >= 5) {
+        FilterType candidates[] = {FilterType::Paeth, FilterType::Sub, FilterType::None};
+        for (auto ft : candidates) {
+            std::vector<FilterType> uniforms(work.height, ft);
+            WriteOptions uwopts;
+            uwopts.filters = uniforms;
+            uwopts.deflate = dopts;
+            auto trial_png = writer.write(work, uwopts);
+            if (trial_png.size() < png_out.size()) {
+                png_out = std::move(trial_png);
+                best_strat = "single-uniform";
+            }
+        }
+    }
 
     CompressResult result;
     result.data = std::move(png_out);
     result.time_seconds = t.elapsed_seconds();
     result.original_size = img.pixels.size();
-    result.strategy_name = s.name;
+    result.strategy_name = best_strat;
     return result;
 }
 

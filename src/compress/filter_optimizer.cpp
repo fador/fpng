@@ -135,332 +135,67 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
             std::memcpy(prev.data(), src, raw_ss);
         }
     } else {
-        // Hill-climbing with restarts (levels 5-6) or Genetic Algorithm (level 7+ or forced)
-        bool use_ga = (opts.level >= 7) || opts.use_genetic;
-
-        if (use_ga) {
-            // === Genetic Algorithm ===
-            // Auto-scale population based on image size
-            int POP = opts.ga_population;
-            int GENS = opts.ga_generations;
-            if (height < 64) {
-                POP = std::min(POP, 10);
-                GENS = std::min(GENS, 15);
-            } else if (height < 256) {
-                POP = std::min(POP, 20);
-                GENS = std::min(GENS, 30);
-            } else {
-                POP = std::min(POP, 30);
-                GENS = std::min(GENS, 50);
-            }
-
-            // Guard: if population too small, fall back to MinSum heuristic
-            if (POP < 5 || GENS < 1) {
-                std::vector<FilterType> fallback(height, FilterType::None);
-                std::vector<uint8_t> prev(raw_ss, 0);
-                for (size_t y = 0; y < height; ++y) {
-                    const uint8_t* src = img.pixels.data() + y * raw_ss;
-                    std::vector<uint8_t> filtered(raw_ss + 1);
-                    FilterType best = FilterType::None;
-                    uint64_t best_cost = std::numeric_limits<uint64_t>::max();
-                    for (int ft = 0; ft <= 4; ++ft) {
-                        auto type = static_cast<FilterType>(ft);
-                        filter_scanline(type, src, filtered.data(), bpp, raw_ss,
-                                         y > 0 ? prev.data() : nullptr);
-                        uint64_t cost = 0;
-                        for (size_t b = 1; b <= raw_ss; ++b) cost += filtered[b];
-                        if (cost < best_cost) { best_cost = cost; best = type; }
-                    }
-                    fallback[y] = best;
-                    std::memcpy(prev.data(), src, raw_ss);
-                }
-                return fallback;
-            }
-
-            const int ELITE = std::max(1, POP / 10);
-
-            struct Individual {
-                std::vector<FilterType> filters;
-                size_t compressed_size = std::numeric_limits<size_t>::max();
-            };
-
-            // Fitness: use MinSum (sum of absolute filtered byte values).
-            // This correlates strongly with LZ77+Huffman compressibility because
-            // smaller filtered values = more repeated small bytes = better matches.
-            // Byte entropy alone is a poor proxy — it can prefer filter None
-            // for gradient images even when Paeth-produced residuals compress
-            // much better with LZ77.
-            //
-            // Because each row's filtered output depends only on the source rows
-            // (not on other rows' chosen filter types), the per-row MinSum for
-            // all 5 filters is precomputed once; a fitness evaluation is then
-            // just a table lookup (O(height)) instead of re-filtering the whole
-            // image (O(height*width)).
-            std::vector<std::array<uint64_t, 5>> row_min_sum(height);
-            {
-                std::vector<uint8_t> prev_src(raw_ss, 0);
-                std::vector<uint8_t> row(raw_ss + 1);
-                for (size_t y = 0; y < height; ++y) {
-                    const uint8_t* src = img.pixels.data() + y * raw_ss;
-                    for (int ft = 0; ft < 5; ++ft) {
-                        filter_scanline(static_cast<FilterType>(ft), src, row.data(),
-                                        bpp, raw_ss, y > 0 ? prev_src.data() : nullptr);
-                        uint64_t s = 0;
-                        for (size_t b = 1; b <= raw_ss; ++b) s += row[b];
-                        row_min_sum[y][ft] = s;
-                    }
-                    std::memcpy(prev_src.data(), src, raw_ss);
-                }
-            }
-            auto fitness = [&](const std::vector<FilterType>& filters) -> size_t {
-                uint64_t min_sum = 0;
-                size_t nrows = std::min(filters.size(), height);
-                for (size_t y = 0; y < nrows; ++y)
-                    min_sum += row_min_sum[y][static_cast<int>(filters[y])];
-                int switches = 0;
-                for (size_t y = 1; y < nrows; ++y)
-                    if (filters[y] != filters[y-1]) ++switches;
-                return static_cast<size_t>(min_sum) + static_cast<size_t>(switches) * 1000;
-            };
-
-            // Initialize population
-            std::vector<Individual> pop(POP);
-
-            // Seed 1: entropy-based heuristic
-            std::vector<uint8_t> prev_h(raw_ss, 0);
+        // Levels 5+: Exact Viterbi Dynamic Programming
+        // Minimizes: sum(row_min_sum[y][filter]) + switches * penalty
+        // Solved to guaranteed global mathematical optimality in O(25 * H) time.
+        std::vector<std::array<uint64_t, 5>> row_min_sum(height);
+        {
+            std::vector<uint8_t> prev_src(raw_ss, 0);
+            std::vector<uint8_t> row(raw_ss + 1);
             for (size_t y = 0; y < height; ++y) {
                 const uint8_t* src = img.pixels.data() + y * raw_ss;
-                FilterType best = FilterType::None;
-                double best_cost = std::numeric_limits<double>::max();
-                for (int ft = 0; ft <= 4; ++ft) {
-                    auto type = static_cast<FilterType>(ft);
-                    double cost = filter_cost(type, src, raw_ss, bpp,
-                                               y > 0 ? prev_h.data() : nullptr);
-                    if (cost < best_cost) { best_cost = cost; best = type; }
+                for (int ft = 0; ft < 5; ++ft) {
+                    filter_scanline(static_cast<FilterType>(ft), src, row.data(),
+                                    bpp, raw_ss, y > 0 ? prev_src.data() : nullptr);
+                    uint64_t s = 0;
+                    for (size_t b = 1; b <= raw_ss; ++b) s += row[b];
+                    row_min_sum[y][ft] = s;
                 }
-                pop[0].filters.push_back(best);
-                std::memcpy(prev_h.data(), src, raw_ss);
+                std::memcpy(prev_src.data(), src, raw_ss);
             }
-            pop[0].compressed_size = fitness(pop[0].filters);
+        }
 
-            // Seeds 2-3: all None, all Paeth
-            pop[1].filters.assign(height, FilterType::None);
-            pop[1].compressed_size = fitness(pop[1].filters);
-            pop[2].filters.assign(height, FilterType::Paeth);
-            pop[2].compressed_size = fitness(pop[2].filters);
+        uint64_t penalty = (opts.level >= 7 || opts.use_genetic) ? 1000 : 500;
 
-            // Seeds 4-N: random perturbations of the heuristic solution
-            std::mt19937 rng(42);
-            for (int p = 3; p < POP; ++p) {
-                pop[p].filters = pop[0].filters;
-                int flips = static_cast<int>(height) / 10 + 2;
-                for (int f = 0; f < flips; ++f) {
-                    size_t row = rng() % height;
-                    pop[p].filters[row] = static_cast<FilterType>(rng() % 5);
-                }
-                pop[p].compressed_size = fitness(pop[p].filters);
-            }
+        uint64_t dp[5];
+        for (int ft = 0; ft < 5; ++ft) dp[ft] = row_min_sum[0][ft];
 
-            // Sort by fitness
-            std::sort(pop.begin(), pop.end(),
-                [](const Individual& a, const Individual& b) {
-                    return a.compressed_size < b.compressed_size;
-                });
+        std::vector<std::array<uint8_t, 5>> parent(height);
 
-            size_t best_overall = pop[0].compressed_size;
-
-            // Evolution loop
-            for (int gen = 0; gen < GENS; ++gen) {
-                std::vector<Individual> next;
-                next.reserve(POP);
-
-                // Elitism
-                for (int e = 0; e < ELITE; ++e)
-                    next.push_back(pop[e]);
-
-                // Crossover + mutation
-                while (static_cast<int>(next.size()) < POP) {
-                    // Tournament selection (pick 3, best wins)
-                    int t1 = rng() % POP, t2 = rng() % POP, t3 = rng() % POP;
-                    int p1 = std::min({t1, t2, t3}, [&](int a, int b) {
-                        return pop[a].compressed_size < pop[b].compressed_size; });
-                    t1 = rng() % POP; t2 = rng() % POP; t3 = rng() % POP;
-                    int p2 = std::min({t1, t2, t3}, [&](int a, int b) {
-                        return pop[a].compressed_size < pop[b].compressed_size; });
-
-                    // Uniform crossover
-                    Individual child;
-                    child.filters.resize(height);
-                    for (size_t r = 0; r < height; ++r) {
-                        child.filters[r] = (rng() & 1) ?
-                            pop[p1].filters[r] : pop[p2].filters[r];
-                    }
-
-                    // Mutation: flip ~5% of rows, with local bursts
-                    double mut_rate = 0.05;
-                    if (gen > GENS / 2) mut_rate = 0.02; // reduce later
-
-                    for (size_t r = 0; r < height; ++r) {
-                        if (rng() % 1000 < static_cast<unsigned long>(mut_rate * 1000)) {
-                            // Local burst: flip this and nearby rows
-                            int burst = (rng() % 3) + 1;
-                            for (int b = 0; b < burst; ++b) {
-                                size_t rr = r + b;
-                                if (rr < height)
-                                    child.filters[rr] = static_cast<FilterType>(rng() % 5);
-                            }
-                        }
-                    }
-
-                    child.compressed_size = fitness(child.filters);
-                    next.push_back(std::move(child));
-                }
-
-                pop = std::move(next);
-                std::sort(pop.begin(), pop.end(),
-                    [](const Individual& a, const Individual& b) {
-                        return a.compressed_size < b.compressed_size;
-                    });
-
-                if (pop[0].compressed_size < best_overall) {
-                    best_overall = pop[0].compressed_size;
-                }
-
-                // Early termination if no improvement for 20 generations
-                if (gen > 20 && gen % 10 == 0) {
-                    bool improved = false;
-                    for (int i = 0; i < ELITE; ++i) {
-                        if (pop[i].compressed_size < best_overall * 0.99) {
-                            improved = true; break;
-                        }
-                    }
-                    if (!improved && pop[0].compressed_size <= best_overall) break;
-                }
-            }
-
-            result = pop[0].filters;
-
-        } else {
-            // === Stochastic hill-climbing with restarts (levels 5-6) ===
-            const int MAX_STEPS = static_cast<int>(height) * 3;
-
-            std::mt19937 rng(42);
-            std::vector<FilterType> best_filters;
-            size_t best_size = std::numeric_limits<size_t>::max();
-
-            // Precompute per-row MinSum for all 5 filters (see GA note above).
-            std::vector<std::array<uint64_t, 5>> hc_row_min_sum(height);
-            {
-                std::vector<uint8_t> prev_src(raw_ss, 0);
-                std::vector<uint8_t> row(raw_ss + 1);
-                for (size_t y = 0; y < height; ++y) {
-                    const uint8_t* src = img.pixels.data() + y * raw_ss;
-                    for (int ft = 0; ft < 5; ++ft) {
-                        filter_scanline(static_cast<FilterType>(ft), src, row.data(),
-                                        bpp, raw_ss, y > 0 ? prev_src.data() : nullptr);
-                        uint64_t s = 0;
-                        for (size_t b = 1; b <= raw_ss; ++b) s += row[b];
-                        hc_row_min_sum[y][ft] = s;
-                    }
-                    std::memcpy(prev_src.data(), src, raw_ss);
-                }
-            }
-            auto fitness_hc = [&](const std::vector<FilterType>& filters) -> size_t {
-                uint64_t min_sum = 0;
-                size_t nrows = std::min(filters.size(), height);
-                for (size_t y = 0; y < nrows; ++y)
-                    min_sum += hc_row_min_sum[y][static_cast<int>(filters[y])];
-                return static_cast<size_t>(min_sum);
-            };
-
-            // Initial solutions to try
-            std::vector<std::vector<FilterType>> initials;
-
-            // Entropy heuristic
-            {
-                std::vector<FilterType> f;
-                std::vector<uint8_t> prev_h(raw_ss, 0);
-                for (size_t y = 0; y < height; ++y) {
-                    const uint8_t* src = img.pixels.data() + y * raw_ss;
-                    FilterType best = FilterType::None;
-                    double best_cost = std::numeric_limits<double>::max();
-                    for (int ft = 0; ft <= 4; ++ft) {
-                        auto type = static_cast<FilterType>(ft);
-                        double cost = filter_cost(type, src, raw_ss, bpp,
-                                                   y > 0 ? prev_h.data() : nullptr);
-                        if (cost < best_cost) { best_cost = cost; best = type; }
-                    }
-                    f.push_back(best);
-                    std::memcpy(prev_h.data(), src, raw_ss);
-                }
-                initials.push_back(f);
-            }
-
-            // All None
-            initials.push_back(std::vector<FilterType>(height, FilterType::None));
-            // All Paeth
-            initials.push_back(std::vector<FilterType>(height, FilterType::Paeth));
-            // All Up
-            initials.push_back(std::vector<FilterType>(height, FilterType::Up));
-            // All Average
-            initials.push_back(std::vector<FilterType>(height, FilterType::Average));
-            // All Sub
-            initials.push_back(std::vector<FilterType>(height, FilterType::Sub));
-
-            // MinSum heuristic
-            {
-                std::vector<FilterType> f;
-                std::vector<uint8_t> prev_i(raw_ss, 0);
-                for (size_t y = 0; y < height; ++y) {
-                    const uint8_t* src = img.pixels.data() + y * raw_ss;
-                    std::vector<uint8_t> row(raw_ss + 1);
-                    FilterType best = FilterType::None;
-                    uint64_t best_cost = std::numeric_limits<uint64_t>::max();
-                    for (int ft = 0; ft <= 4; ++ft) {
-                        auto type = static_cast<FilterType>(ft);
-                        filter_scanline(type, src, row.data(), bpp, raw_ss,
-                                         y > 0 ? prev_i.data() : nullptr);
-                        uint64_t cost = sum_abs(row.data() + 1, raw_ss);
-                        if (cost < best_cost) { best_cost = cost; best = type; }
-                    }
-                    f.push_back(best);
-                    std::memcpy(prev_i.data(), src, raw_ss);
-                }
-                initials.push_back(f);
-            }
-
-            for (auto& current : initials) {
-                size_t current_size = fitness_hc(current);
-
-                // Hill climb
-                int steps_without_improvement = 0;
-                for (int step = 0; step < MAX_STEPS && steps_without_improvement < 50; ++step) {
-                    // Try flipping a random contiguous block of rows
-                    size_t start = rng() % height;
-                    size_t count = (rng() % std::min(size_t(5), height - start)) + 1;
-                    std::vector<FilterType> neighbor = current;
-                    for (size_t r = start; r < start + count && r < height; ++r)
-                        neighbor[r] = static_cast<FilterType>(rng() % 5);
-
-                    size_t neighbor_size = fitness_hc(neighbor);
-                    if (neighbor_size < current_size) {
-                        current = std::move(neighbor);
-                        current_size = neighbor_size;
-                        steps_without_improvement = 0;
-                    } else {
-                        ++steps_without_improvement;
+        for (size_t y = 1; y < height; ++y) {
+            uint64_t next_dp[5];
+            for (int cur = 0; cur < 5; ++cur) {
+                uint64_t best_c = std::numeric_limits<uint64_t>::max();
+                uint8_t best_p = 0;
+                for (int prev = 0; prev < 5; ++prev) {
+                    uint64_t c = dp[prev] + (prev != cur ? penalty : 0);
+                    if (c < best_c) {
+                        best_c = c;
+                        best_p = static_cast<uint8_t>(prev);
                     }
                 }
-
-                if (current_size < best_size) {
-                    best_size = current_size;
-                    best_filters = std::move(current);
-                }
+                next_dp[cur] = best_c + row_min_sum[y][cur];
+                parent[y][cur] = best_p;
             }
+            for (int ft = 0; ft < 5; ++ft) dp[ft] = next_dp[ft];
+        }
 
-            result = best_filters;
+        int best_last = 0;
+        uint64_t min_total = dp[0];
+        for (int ft = 1; ft < 5; ++ft) {
+            if (dp[ft] < min_total) {
+                min_total = dp[ft];
+                best_last = ft;
+            }
+        }
+
+        int cur = best_last;
+        for (size_t y = height; y-- > 0;) {
+            result[y] = static_cast<FilterType>(cur);
+            if (y > 0) cur = parent[y][cur];
         }
     }
+
 
     return result;
 }

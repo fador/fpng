@@ -1,4 +1,4 @@
-build/
+build*/
 *.o
 *.obj
 *.exe
@@ -9,3 +9,4 @@ compile_commands.json
 test_images/
 *.png.tmp
 *.swp
+tools/
