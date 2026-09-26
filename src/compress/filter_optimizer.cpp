@@ -17,7 +17,10 @@ namespace {
 
 uint64_t sum_abs(const uint8_t* data, size_t size) {
     uint64_t sum = 0;
-    for (size_t i = 0; i < size; ++i) sum += data[i];
+    for (size_t i = 0; i < size; ++i) {
+        int8_t v = static_cast<int8_t>(data[i]);
+        sum += static_cast<uint64_t>(std::abs(static_cast<int>(v)));
+    }
     return sum;
 }
 
@@ -147,9 +150,7 @@ std::vector<FilterType> optimize_filters(const Image& img, const FilterOptions& 
                 for (int ft = 0; ft < 5; ++ft) {
                     filter_scanline(static_cast<FilterType>(ft), src, row.data(),
                                     bpp, raw_ss, y > 0 ? prev_src.data() : nullptr);
-                    uint64_t s = 0;
-                    for (size_t b = 1; b <= raw_ss; ++b) s += row[b];
-                    row_min_sum[y][ft] = s;
+                    row_min_sum[y][ft] = sum_abs(row.data() + 1, raw_ss);
                 }
                 std::memcpy(prev_src.data(), src, raw_ss);
             }
