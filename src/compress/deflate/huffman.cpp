@@ -13,125 +13,111 @@ namespace {
 
 constexpr uint64_t INF_64 = std::numeric_limits<uint64_t>::max() / 4;
 
-// Optimal length-limited Huffman code lengths via dynamic programming.
-// This is equivalent to the Package-Merge algorithm (Larmore & Hirschberg,
-// 1990) and guarantees minimal total bit cost subject to the max_bits
-// constraint. Runs in O(m^3 * max_bits) where m = number of active symbols.
-// Because it is only invoked when a plain Huffman tree exceeds max_bits (a
-// rare, skewed distribution), and bounded to small m, this is acceptable.
-void optimal_length_limited_lengths(const uint32_t* freqs, size_t n,
-                                    int max_bits, uint8_t* lengths) {
-    std::vector<std::pair<uint32_t, int>> active;
-    for (size_t i = 0; i < n; ++i)
-        if (freqs[i] > 0) active.push_back({freqs[i], static_cast<int>(i)});
-    size_t m = active.size();
+// Optimal length-limited Huffman code lengths via the Package-Merge algorithm
+// (Larmore & Hirschberg, 1990).
+// Guarantees minimal total bit cost subject to max_bits constraint in O(m * max_bits) time.
+void package_merge_lengths(const uint32_t* freqs, size_t n, int max_bits, uint8_t* lengths) {
+    struct ActiveSym {
+        uint64_t weight;
+        int symbol;
+    };
+    std::vector<ActiveSym> symbols;
+    symbols.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        if (freqs[i] > 0) {
+            symbols.push_back({freqs[i], static_cast<int>(i)});
+        }
+    }
+    size_t m = symbols.size();
     if (m == 0) return;
-    if (m == 1) { lengths[active[0].second] = 1; return; }
-    std::sort(active.begin(), active.end());
-
-    // prefix sums for O(1) interval weight queries
-    std::vector<uint64_t> ps(m + 1, 0);
-    for (size_t i = 0; i < m; ++i) ps[i + 1] = ps[i] + active[i].first;
-    auto interval_cost = [&](size_t i, size_t j) { return ps[j + 1] - ps[i]; };
-
-    size_t H = static_cast<size_t>(max_bits);
-    // opt[i][j][h] = min internal-node cost of a binary tree over active[i..j]
-    //                with max depth h. split[i][j][h] = subtree split point.
-    std::vector<uint64_t> opt(m * m * (H + 1), INF_64);
-    std::vector<int32_t> split(m * m * (H + 1), -1);
-    auto idx = [&](size_t i, size_t j, size_t h) { return (j * m + i) * (H + 1) + h; };
-
-    for (size_t h = 0; h <= H; ++h)
-        for (size_t i = 0; i < m; ++i) opt[idx(i, i, h)] = 0;
-
-    for (size_t h = 1; h <= H; ++h) {
-        for (size_t len = 2; len <= m; ++len) {
-            for (size_t i = 0; i + len <= m; ++i) {
-                size_t j = i + len - 1;
-                uint64_t best = INF_64;
-                int32_t bestk = -1;
-                for (size_t k = i; k < j; ++k) {
-                    uint64_t l = opt[idx(i, k, h - 1)];
-                    uint64_t r = opt[idx(k + 1, j, h - 1)];
-                    if (l == INF_64 || r == INF_64) continue;
-                    uint64_t v = l + r;
-                    if (v < best) { best = v; bestk = static_cast<int32_t>(k); }
-                }
-                if (bestk >= 0) {
-                    opt[idx(i, j, h)] = best + interval_cost(i, j);
-                    split[idx(i, j, h)] = bestk;
-                }
-            }
-        }
+    if (m == 1) {
+        lengths[symbols[0].symbol] = 1;
+        return;
+    }
+    if (m == 2) {
+        lengths[symbols[0].symbol] = 1;
+        lengths[symbols[1].symbol] = 1;
+        return;
     }
 
-    // Reconstruct per-symbol depths from the split table.
-    std::function<void(size_t, size_t, size_t, int)> rec =
-        [&](size_t i, size_t j, size_t h, int depth) {
-            if (i == j) { lengths[active[i].second] = static_cast<uint8_t>(depth); return; }
-            int32_t k = split[idx(i, j, h)];
-            if (k < 0) { // robustness fallback (should not occur when finite)
-                for (size_t t = i; t <= j; ++t)
-                    lengths[active[t].second] = static_cast<uint8_t>(depth);
-                return;
-            }
-            size_t hc = h > 0 ? h - 1 : 0;
-            rec(i, static_cast<size_t>(k), hc, depth + 1);
-            rec(static_cast<size_t>(k) + 1, j, hc, depth + 1);
-        };
-    rec(0, m - 1, H, 0);
-}
+    std::sort(symbols.begin(), symbols.end(), [](const ActiveSym& a, const ActiveSym& b) {
+        if (a.weight != b.weight) return a.weight < b.weight;
+        return a.symbol < b.symbol;
+    });
 
-// Simple (non-optimal but valid) length limiter, used only as a fallback when
-// the optimal DP would be too expensive (many active symbols).
-void simple_length_limiter(const uint32_t* freqs, size_t n, int max_bits,
-                           uint8_t* lengths) {
-    // Repeatedly shorten the deepest code and lengthen the shallowest code.
-    // This strictly reduces the maximum length each iteration, so it always
-    // terminates. A final pass repairs the Kraft inequality.
-    for (;;) {
-        int max_len = 0;
-        for (size_t i = 0; i < n; ++i)
-            if (lengths[i] > max_len) max_len = lengths[i];
-        if (max_len <= max_bits) break;
+    struct Item {
+        uint64_t weight;
+        int32_t symbol; // >= 0 if leaf symbol, or -1 if package
+        int32_t left;   // index in arena
+        int32_t right;  // index in arena
+    };
 
-        int deep = -1;
-        for (size_t i = 0; i < n; ++i)
-            if (static_cast<int>(lengths[i]) == max_len &&
-                (deep < 0 || freqs[i] > freqs[deep])) deep = static_cast<int>(i);
+    std::vector<Item> arena;
+    arena.reserve(m * (max_bits + 1) * 2);
 
-        int shallow = -1;
-        for (size_t i = 0; i < n; ++i)
-            if (lengths[i] > 0 && lengths[i] < static_cast<int>(max_bits) &&
-                (shallow < 0 || lengths[i] < lengths[shallow] ||
-                 (lengths[i] == lengths[shallow] && freqs[i] < freqs[shallow])))
-                shallow = static_cast<int>(i);
+    // Initial level (level 1): only leaf symbols
+    std::vector<int32_t> current_level;
+    current_level.reserve(m * 2);
 
-        if (deep < 0 || shallow < 0 || deep == shallow) break;
-        lengths[deep]--;
-        lengths[shallow]++;
+    std::vector<int32_t> initial_symbols;
+    initial_symbols.reserve(m);
+    for (size_t i = 0; i < m; ++i) {
+        int32_t idx = static_cast<int32_t>(arena.size());
+        arena.push_back({symbols[i].weight, symbols[i].symbol, -1, -1});
+        initial_symbols.push_back(idx);
+        current_level.push_back(idx);
     }
 
-    // Repair Kraft inequality so the lengths form a valid prefix code.
-    for (;;) {
-        int bl_count[17] = {};
-        int left = 2;
-        int overflow_at = -1;
-        for (size_t i = 0; i < n; ++i)
-            if (lengths[i] > 0) bl_count[lengths[i]]++;
-        for (int b = 1; b <= max_bits; ++b) {
-            left -= bl_count[b];
-            if (left < 0) { overflow_at = b; break; }
-            left *= 2;
-        }
-        if (overflow_at < 0) break;
+    // Process levels 2..max_bits
+    std::vector<int32_t> packages;
+    packages.reserve(m);
+    std::vector<int32_t> next_level;
+    next_level.reserve(m * 2);
 
-        int best = -1;
-        for (size_t i = 0; i < n; ++i)
-            if (lengths[i] == overflow_at && lengths[i] < max_bits &&
-                (best < 0 || freqs[i] > freqs[best])) best = static_cast<int>(i);
-        if (best < 0) break;
-        lengths[best]++;
+    for (int level = 2; level <= max_bits; ++level) {
+        packages.clear();
+        for (size_t i = 0; i + 1 < current_level.size(); i += 2) {
+            int32_t left = current_level[i];
+            int32_t right = current_level[i + 1];
+            uint64_t w = arena[left].weight + arena[right].weight;
+            int32_t p_idx = static_cast<int32_t>(arena.size());
+            arena.push_back({w, -1, left, right});
+            packages.push_back(p_idx);
+        }
+
+        next_level.clear();
+        size_t i = 0, j = 0;
+        while (i < initial_symbols.size() && j < packages.size()) {
+            if (arena[initial_symbols[i]].weight <= arena[packages[j]].weight) {
+                next_level.push_back(initial_symbols[i++]);
+            } else {
+                next_level.push_back(packages[j++]);
+            }
+        }
+        while (i < initial_symbols.size()) next_level.push_back(initial_symbols[i++]);
+        while (j < packages.size()) next_level.push_back(packages[j++]);
+
+        current_level = std::move(next_level);
+    }
+
+    size_t num_to_select = std::min(current_level.size(), 2 * m - 2);
+    // Reset lengths for all symbols to 0 before accumulating
+    for (size_t i = 0; i < n; ++i) lengths[i] = 0;
+
+    std::vector<int32_t> stack;
+    for (size_t k = 0; k < num_to_select; ++k) {
+        stack.push_back(current_level[k]);
+        while (!stack.empty()) {
+            int32_t curr = stack.back();
+            stack.pop_back();
+            const auto& it = arena[curr];
+            if (it.symbol >= 0) {
+                lengths[it.symbol]++;
+            } else {
+                if (it.right >= 0) stack.push_back(it.right);
+                if (it.left >= 0) stack.push_back(it.left);
+            }
+        }
     }
 }
 
@@ -215,10 +201,8 @@ void compute_huffman_lengths(const uint32_t* freqs, size_t n, int max_bits,
         if (lengths[i] > max_len) max_len = lengths[i];
     if (max_len <= max_bits) return;
 
-    // Length limiting: use optimal length-limited codes. The DP is only
-    // reached when a plain Huffman tree exceeds max_bits (rare, skewed
-    // distributions), so its higher cost is acceptable.
-    optimal_length_limited_lengths(freqs, n, max_bits, lengths.data());
+    // Length limiting: use optimal length-limited codes via Package-Merge.
+    package_merge_lengths(freqs, n, max_bits, lengths.data());
 }
 
 } // anonymous namespace
