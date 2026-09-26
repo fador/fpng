@@ -475,6 +475,50 @@ std::vector<std::pair<size_t, size_t>> token_aware_split(
 
 } // anonymous namespace
 
+// Optimal per-block encoding: compares Fixed Huffman, Dynamic Huffman, and Stored
+// and emits the representation that produces the smallest exact bit stream.
+void encode_block_optimal(BitWriter& bw,
+                          const std::vector<LZ77Parser::Token>& tokens,
+                          size_t tb, size_t te,
+                          const uint8_t* raw_data, size_t block_size,
+                          bool is_last) {
+    // 1. Fixed Huffman bit cost
+    uint64_t fixed_bits = 3; // BFINAL (1) + BTYPE (2)
+    for (size_t i = tb; i < te; ++i) {
+        auto& t = tokens[i];
+        if (t.type == LZ77Parser::Token::LITERAL) {
+            fixed_bits += get_fixed_litlen(t.literal).bits;
+        } else {
+            int lc = deflate::length_code(t.match_length);
+            fixed_bits += get_fixed_litlen(257 + lc).bits + deflate::length_extra_bits(lc);
+            int dc = deflate::distance_code(t.match_distance);
+            fixed_bits += get_fixed_dist(dc).bits + deflate::distance_extra_bits(dc);
+        }
+    }
+    fixed_bits += get_fixed_litlen(deflate::END_OF_BLOCK).bits;
+
+    // 2. Stored block bit cost (RFC 1951 max stored size is 65535)
+    uint64_t stored_bits = std::numeric_limits<uint64_t>::max();
+    if (block_size <= 65535) {
+        int pad = (8 - ((bw.bit_count() + 3) & 7)) & 7;
+        stored_bits = 3 + pad + 32 + block_size * 8;
+    }
+
+    // 3. Dynamic Huffman exact bit cost
+    BitWriter test_bw;
+    encode_dynamic_tokens(test_bw, tokens, tb, te, is_last);
+    uint64_t dynamic_bits = static_cast<uint64_t>(test_bw.byte_count()) * 8 + test_bw.bit_count();
+
+    // Whichever is strictly smallest wins
+    if (fixed_bits <= dynamic_bits && fixed_bits <= stored_bits) {
+        encode_fixed_tokens(bw, tokens, tb, te, is_last);
+    } else if (stored_bits <= dynamic_bits) {
+        write_stored_block(bw, raw_data, block_size, is_last);
+    } else {
+        encode_dynamic_tokens(bw, tokens, tb, te, is_last);
+    }
+}
+
 std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
                                          const DeflateOptions& opts) {
     if (data.empty()) return {};
@@ -540,6 +584,9 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
         int iters = std::max(1, adjusted.iterations);
         std::vector<uint8_t> ll_len, d_len;
         std::vector<uint16_t> actual_costs;
+        std::vector<LZ77Parser::Token> best_tokens;
+        uint64_t best_token_bits = std::numeric_limits<uint64_t>::max();
+
         for (int iter = 0; iter < iters; ++iter) {
             if (iter == 0) {
                 popts.optimal = false;
@@ -554,18 +601,35 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
 
             uint32_t ll_freq[deflate::MAX_LITLEN_SYMS] = {};
             uint32_t d_freq[deflate::MAX_DIST_SYMS] = {};
+            uint64_t extra_bits = 0;
             for (size_t i = 0; i + 1 < tokens.size(); ++i) {
                 auto& t = tokens[i];
                 if (t.type == LZ77Parser::Token::LITERAL) {
                     ll_freq[t.literal]++;
                 } else {
-                    ll_freq[257 + deflate::length_code(t.match_length)]++;
-                    d_freq[deflate::distance_code(t.match_distance)]++;
+                    int lc = deflate::length_code(t.match_length);
+                    int dc = deflate::distance_code(t.match_distance);
+                    ll_freq[257 + lc]++;
+                    d_freq[dc]++;
+                    extra_bits += deflate::length_extra_bits(lc) + deflate::distance_extra_bits(dc);
                 }
             }
             ll_freq[deflate::END_OF_BLOCK] = 1;
             ll_len = HuffmanEncoder::compute_lengths(ll_freq, deflate::MAX_LITLEN_SYMS, 15);
             d_len = HuffmanEncoder::compute_lengths(d_freq, deflate::MAX_DIST_SYMS, 15);
+
+            // Compute total encoded bit length of this tokenization
+            uint64_t total_bits = extra_bits;
+            for (int s = 0; s < deflate::MAX_LITLEN_SYMS; ++s)
+                total_bits += static_cast<uint64_t>(ll_freq[s]) * ll_len[s];
+            for (int s = 0; s < deflate::MAX_DIST_SYMS; ++s)
+                total_bits += static_cast<uint64_t>(d_freq[s]) * d_len[s];
+
+            if (total_bits < best_token_bits) {
+                best_token_bits = total_bits;
+                best_tokens = tokens;
+            }
+
             uint32_t total_ll = 0;
             for (int s = 0; s < deflate::MAX_LITLEN_SYMS; ++s) total_ll += ll_freq[s];
             uint32_t total_d = 0;
@@ -591,7 +655,18 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
                     actual_costs[deflate::MAX_LITLEN_SYMS + s] = static_cast<uint16_t>(std::clamp(bits * 1024.0, 1024.0, 15.0 * 1024.0));
                 }
             }
+
+            // Squeezing: on higher iterations, perturb costs slightly to escape local minima
+            if (iter >= 2 && iter + 1 < iters) {
+                for (size_t s = 0; s < actual_costs.size(); ++s) {
+                    uint32_t hash = static_cast<uint32_t>((s * 2654435761u) ^ (static_cast<uint32_t>(iter) * 1103515245u));
+                    int delta = static_cast<int>(hash % 101) - 50; // [-50, +50] in Q10
+                    int nc = static_cast<int>(actual_costs[s]) + delta;
+                    actual_costs[s] = static_cast<uint16_t>(std::clamp(nc, 1024, 15360));
+                }
+            }
         }
+        tokens = std::move(best_tokens);
     }
 
     const size_t real = tokens.empty() ? 0 : tokens.size() - 1; // exclude EOB
@@ -630,35 +705,7 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
         size_t endb = (te < off.size()) ? off[te] : data.size();
         size_t block_size = endb - start;
 
-        // Short blocks: dynamic Huffman overhead exceeds savings. Use stored
-        // for very small blocks, or for 256-512 byte blocks whose byte entropy
-        // is high (incompressible).
-        bool use_stored = false;
-        if (adjusted.level < CompressionLevel::Ultra) {
-            if (block_size < 256) {
-                use_stored = true;
-            } else if (block_size < 512) {
-                uint32_t freq[256] = {};
-                for (size_t i = start; i < endb; ++i)
-                    freq[data[i]]++;
-                double ent = 0;
-                double inv = 1.0 / block_size;
-                for (int i = 0; i < 256; ++i) {
-                    if (freq[i] > 0) {
-                        double p = freq[i] * inv;
-                        ent -= p * std::log2(p);
-                    }
-                }
-                use_stored = (ent >= 3.0);
-            }
-        }
-
-        if (use_stored)
-            write_stored_block(bw, data.data() + start, block_size, is_last);
-        else if (adjusted.level >= CompressionLevel::Default)
-            encode_dynamic_tokens(bw, tokens, tb, te, is_last);
-        else
-            encode_fixed_tokens(bw, tokens, tb, te, is_last);
+        encode_block_optimal(bw, tokens, tb, te, data.data() + start, block_size, is_last);
     }
 
     bw.flush_to_byte();
