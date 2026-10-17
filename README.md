@@ -19,9 +19,9 @@ fpng -s input.png                 # single-strategy (faster)
 | **LZ77** | Multi-stride hash chains (2D spatial diagonal probing, 3-byte chain walk, Zopfli-style squeezing) |
 | **Huffman** | True Package-Merge ($O(N \cdot L)$) guaranteed-optimal length-limited codes |
 | **SIMD** | NEON (ARM), AVX2/SSE4.2 (x86) accelerated match length computation |
-| **Filter Opt** | Exact 5-state Viterbi Dynamic Programming ($O(25 \times H)$, <1ms) + MinSum & Shannon entropy |
-| **Pre-process** | Alpha-zeroing, color type reduction, 2-Opt TSP adjacency & RGB palette sorting, 16→8 bit depth |
-| **Multi-strategy** | Parallel trials via `std::async` — tries 14 filter+DEFLATE combinations, picks best |
+| **Filter Opt** | Exact 5-state Viterbi DP ($O(25 \times H)$, <1ms), History-Aware Windowed Trial, Cumulative Cross-Entropy + LZ Bonus, MinSum & Shannon Entropy |
+| **Pre-process** | Alpha-zeroing, color type reduction, sub-byte packing (1/2/4-bit gray & indexed), palette compaction, 2-Opt TSP palette sorting, lossless 16→8 bit depth |
+| **Multi-strategy** | Parallel trials via `std::async` with variant/filter stream deduplication across 34 strategy & uniform-filter configurations |
 | **Safety** | Automatically keeps original if compression doesn't reduce size |
 | **Dependencies** | None — pure C++20 standard library |
 
@@ -54,8 +54,8 @@ Input PNG
 ┌──────────────────────────┐
 │ Compressor               │  Multi-strategy orchestrator
 │  ├─ Content analysis     │  Classify image (photo/graphic/noise)
-│  ├─ Strategy selection   │  Pick promising filter+DEFLATE combos
-│  ├─ Parallel trials      │  std::async → multiple compression attempts
+│  ├─ Variant dedup        │  Deduplicate pre-processed images & filter streams
+│  ├─ Parallel trials      │  std::async → proxy ranking + multi-iter Ultra
 │  └─ Best pick            │  Smallest output wins
 └──────────────────────────┘
     │
@@ -63,18 +63,19 @@ Input PNG
 ┌──────────────────────────┐
 │ Filter Optimizer         │  Per-scanline filter selection
 │  L0: MinSum              │  Signed sum-of-abs heuristic
-│  L1-2: Entropy           │  Shannon entropy minimization
-│  L3-4: Brute-force       │  Windowed trial compression
+│  L1: Cumul. Entropy+LZ   │  Rolling cross-entropy + local 3-byte repeat bonus
+│  L2: Entropy             │  Per-scanline Shannon entropy minimization
+│  L3-4: Windowed Trial    │  History-aware sliding window trial compression
 │  L5+: Viterbi DP         │  Exact 5-state trellis (O(25×H), <1ms)
 └──────────────────────────┘
     │
     ▼
 ┌──────────────────────────┐
 │ DEFLATE Compressor       │  Custom RFC 1951 implementation
-│  ├─ Match Finder         │  2D diagonal probing + 3-byte chain walk
+│  ├─ Match Finder         │  1x/2x 2D diagonal probing + RLE + 64-step 3-byte walk
 │  ├─ LZ77 Parser          │  Greedy + lazy + optimal forward DP
-│  ├─ Huffman Encoder      │  Package-Merge optimal length-limiting
-│  ├─ Squeezer             │  Iterative refinement + perturbation
+│  ├─ Huffman Encoder      │  Package-Merge optimal length-limiting + cross-alphabet RLE
+│  ├─ Squeezer             │  Blended entropy/Huffman iterative refinement + per-block DP
 │  └─ Dynamic/Fixed/Stored │  Exact bit-cost optimal block typing
 └──────────────────────────┘
     │
@@ -91,10 +92,11 @@ Output PNG
 ## Compression Pipeline
 
 ### 1. Pre-processing (optional, per-strategy)
-- **Alpha zeroing**: Set RGB of fully-transparent pixels to (0,0,0)
-- **Color reduction**: RGB→Grayscale, RGBA→RGB, Truecolor→Indexed (≤256 colors)
-- **Bit depth reduction**: 16→8 bit when high byte unused
-- **Palette sorting**: Reorder by luminance for better filter compression
+- **Alpha zeroing**: Set RGB of fully-transparent pixels to (0,0,0), strip opaque alpha, or convert binary alpha to `tRNS`
+- **Color reduction**: RGB→Grayscale, RGBA→RGB/Grayscale+Alpha, Truecolor→Indexed (≤256 colors)
+- **Palette compaction & sub-byte packing**: Prune unused/duplicate palette entries and pack Indexed or Grayscale samples down to 1, 2, or 4 bits per pixel
+- **Bit depth reduction**: Lossless 16→8 bit when high and low bytes match (`hi == lo`)
+- **Palette sorting**: 2-Opt TSP pixel-adjacency reordering for better filter compression
 
 ### 2. Filter Selection
 For each scanline, choose from 5 PNG filter types:
@@ -106,8 +108,8 @@ For each scanline, choose from 5 PNG filter types:
 
 ### 3. DEFLATE Compression
 - **LZ77 parsing**: Find back-references (matches) in the 32KB sliding window
-- **Huffman coding**: Build optimal prefix codes for literals and match lengths/distances
-- **Iterative refinement**: First pass greedy → build Huffman → second pass optimal DP with actual costs
+- **Huffman coding**: Build optimal prefix codes for literals and match lengths/distances, with RFC 1951 cross-alphabet RLE header encoding
+- **Iterative refinement**: Blended Shannon entropy + Package-Merge Huffman cost feedback across up to 5 optimal-parse passes, followed by per-block optimal LZ77 refinement
 
 ### 4. Output
 - Single IDAT chunk for maximum compression
@@ -118,12 +120,11 @@ For each scanline, choose from 5 PNG filter types:
 
 | Level | Filter Strategy | DEFLATE | Strategies | Best For |
 |-------|----------------|---------|------------|----------|
-| 0 | MinSum heuristic | Stored blocks | 1 | Fastest, no compression |
-| 1-2 | Entropy-based | Fixed Huffman | 2 | Quick optimization |
-| 3-4 | Entropy-based | Dynamic Huffman | 2 | Balanced |
-| 5-6 | Viterbi DP trellis | Dynamic + 2 iter | 4 | Good compression |
-| 7-8 | Viterbi DP trellis | Dynamic + 2 iter | 14 | Better compression |
-| 9 | Viterbi DP + all variants | Dynamic + 3 iter (Zopfli squeezing) | 14 | Maximum compression |
+| 0 | MinSum heuristic | Fast (1 iter) | 1 | Fastest compression |
+| 1-3 | MinSum + Cumulative/Row Entropy | Default / Best (1 iter) | 3 | Quick optimization |
+| 4-6 | MinSum + Entropy + Trial + Viterbi + Uniform | Best (2 iter) | 6 + Uniforms | Balanced / Good |
+| 7-8 | All filter levels (0–7) + Color Reduce + Uniform | Ultra (3 iter) | 34 + Uniforms | High compression |
+| 9 | All filter levels (0–7) + Color Reduce + Uniform | Ultra (5 iter Zopfli squeezing) | 34 + Uniforms | Maximum compression |
 
 ## Benchmark Results
 
@@ -133,41 +134,41 @@ Evaluated against `optipng` (v0.7.8, `-o7`) and `pngcrush` (v1.8.13, `-brute`) a
 
 | Tool | Total Compressed Size | Compression Ratio | vs. Original |
 |------|----------------------|-------------------|:------------:|
-| **fpng** | **95,318 B** | **11.9%** | **−88.1%** |
+| **fpng** | **89,830 B** | **11.2%** | **−88.8%** |
 | pngcrush | 102,184 B | 12.8% | −87.2% |
 | optipng | 100,394 B | 13.4% | −86.6% |
 
-> **Overall Result**: `fpng` achieves an overall compression ratio of **11.9%**, outperforming both `pngcrush` (12.8%) and `optipng` (13.4%).
+> **Overall Result**: `fpng` achieves an overall compression ratio of **11.2%** (and **123,022 B / 14.67%** across the full 223-image bundled corpus of 838,423 B), outperforming both `pngcrush` (12.8%) and `optipng` (13.4%).
 
 ### Indexed Colormap Images (`test_images/*3p08.png`)
 
-Thanks to 2-Opt TSP adjacency & Euclidean RGB palette reordering, `fpng` outperforms `pngcrush` on 100% of tested indexed images:
+Thanks to palette compaction, sub-byte bit packing, and 2-Opt TSP adjacency & Euclidean RGB palette reordering, `fpng` outperforms `pngcrush` on 100% of tested indexed images:
 
 | Image | Original | fpng | pngcrush | `fpng` Advantage |
 |---|---:|---:|---:|:---:|
-| `basi3p08.png` | 1,527 B | **916 B** | 1,435 B | **−36.2%** |
-| `basn3p08.png` | 1,263 B | **916 B** | 1,253 B | **−26.9%** |
-| `ccwn3p08.png` | 1,554 B | **1,407 B** | 1,534 B | **−8.3%** |
-| `ch2n3p08.png` | 1,810 B | **916 B** | 1,253 B | **−26.9%** |
-| `cs3n3p08.png` | 259 B | **213 B** | 259 B | **−17.8%** |
+| `basi3p08.png` | 1,527 B | **912 B** | 1,435 B | **−36.4%** |
+| `basn3p08.png` | 1,263 B | **912 B** | 1,253 B | **−27.2%** |
+| `ccwn3p08.png` | 1,554 B | **1,384 B** | 1,534 B | **−9.8%** |
+| `ch2n3p08.png` | 1,810 B | **912 B** | 1,253 B | **−27.2%** |
+| `cs3n3p08.png` | 259 B | **212 B** | 259 B | **−18.1%** |
 | `cs5n3p08.png` | 271 B | **220 B** | 271 B | **−18.8%** |
 | `cs8n3p08.png` | 256 B | **205 B** | 256 B | **−19.9%** |
-| `tbbn3p08.png` | 1,499 B | **1,455 B** | 1,477 B | **−1.5%** |
-| `tbgn3p08.png` | 1,499 B | **1,474 B** | 1,477 B | **−0.2%** |
-| `tbwn3p08.png` | 1,496 B | **1,447 B** | 1,490 B | **−2.9%** |
-| `tbyn3p08.png` | 1,499 B | **1,450 B** | 1,477 B | **−1.8%** |
-| `tp0n3p08.png` | 1,476 B | **1,443 B** | 1,469 B | **−1.8%** |
-| `tp1n3p08.png` | 1,483 B | **1,434 B** | 1,477 B | **−2.9%** |
-| **Indexed Suite Total** | **17,310 B** | **14,657 B (84.7%)** | **16,171 B (93.4%)** | **`fpng` wins on all** |
+| `tbbn3p08.png` | 1,499 B | **1,438 B** | 1,477 B | **−2.6%** |
+| `tbgn3p08.png` | 1,499 B | **1,453 B** | 1,477 B | **−1.6%** |
+| `tbwn3p08.png` | 1,496 B | **1,443 B** | 1,490 B | **−3.2%** |
+| `tbyn3p08.png` | 1,499 B | **1,443 B** | 1,477 B | **−2.3%** |
+| `tp0n3p08.png` | 1,476 B | **1,441 B** | 1,469 B | **−1.9%** |
+| `tp1n3p08.png` | 1,483 B | **1,430 B** | 1,477 B | **−3.2%** |
+| **Indexed Suite Total** | **17,310 B** | **14,566 B (84.1%)** | **16,171 B (93.4%)** | **`fpng` wins on all** |
 
 ### Synthetic & Geometric Images
 
 | Image | Original | fpng | pngcrush | Best |
 |---|---:|---:|---:|:---:|
 | `gradient-32x32.png` | 117 B | **104 B** | 104 B | 104 B |
-| `gradient-64x64.png` | 194 B | **139 B** | 139 B | 139 B |
-| `gradient-128x128.png` | 461 B | **292 B** | 293 B | **292 B (fpng)** |
-| `synth_blocks_128x128.png` | 51,939 B | **197 B** | 275 B | **197 B (fpng)** |
+| `gradient-64x64.png` | 194 B | **138 B** | 139 B | **138 B (fpng)** |
+| `gradient-128x128.png` | 461 B | **289 B** | 293 B | **289 B (fpng)** |
+| `synth_blocks_128x128.png` | 51,939 B | **186 B** | 275 B | **186 B (fpng)** |
 | `synth_gradient_128x128.png` | 6,569 B | **222 B** | 223 B | **222 B (fpng)** |
 | `synth_gradient_256x256.png` | 26,133 B | **355 B** | 357 B | **355 B (fpng)** |
 
@@ -184,13 +185,13 @@ Thanks to 2-Opt TSP adjacency & Euclidean RGB palette reordering, `fpng` outperf
 | ect | C++ | Custom fast DEFLATE + multithreading |
 
 fpng's key technical strengths:
-- **Exact Viterbi Dynamic Programming**: Solves global per-scanline filter assignment ($O(25 \times H)$) in under 1ms, replacing slow stochastic GAs.
-- **True Package-Merge Huffman**: Guaranteed mathematically optimal length-limited prefix codes in $O(N \cdot L)$ time per RFC 1951.
-- **2-Opt TSP Palette Permutation**: Minimizes filter residuals for indexed images via pixel adjacency co-occurrence graph.
-- **RFC 1951 Optimal Block Typing**: Automatically evaluates and emits the strictly smallest representation between Dynamic Huffman, Fixed Huffman, and Stored blocks.
-- **2D Spatial & Diagonal Probing**: Probes vertical and diagonal pixel matches ($\text{row\_stride} \pm \Delta$) to capture planar 2D image redundancies.
-- **Zopfli-Style Squeezing**: Iterative forward-DP with cost perturbations and best-token retention to break out of local minima.
-- **Multi-strategy parallel trials**: 14 strategies evaluated in parallel via `std::async`, with safety fallback to original.
+- **Exact Viterbi Dynamic Programming**: Solves global per-scanline filter assignment ($O(25 \times H)$) in under 1ms, complemented by history-aware windowed trial compression and cumulative cross-entropy filters.
+- **True Package-Merge Huffman & Cross-Alphabet RLE**: Guaranteed mathematically optimal length-limited prefix codes in $O(N \cdot L)$ time per RFC 1951, with cross-alphabet `HLIT`+`HDIST` header RLE and exact `HCLEN` scoring.
+- **2-Opt TSP Palette Permutation & Sub-Byte Compaction**: Prunes unused/duplicate palette entries, packs Indexed and Grayscale images down to 1/2/4-bit depth, and minimizes filter residuals via pixel adjacency co-occurrence TSP.
+- **RFC 1951 Optimal Block Typing & Per-Block Refinement**: Automatically evaluates Dynamic Huffman, Fixed Huffman, and Stored blocks, with per-block optimal LZ77 re-parsing after adaptive token-stream splitting.
+- **2D Spatial & Diagonal Probing**: Probes `1x` and `2x` vertical/diagonal pixel matches ($\text{row\_stride} \pm \Delta$), periodic RLE distances `1..4`, and 64-step 3-byte hash chains.
+- **Zopfli-Style Squeezing**: Iterative forward-DP with blended Shannon/Huffman cost tables, cost perturbations, and best-token retention to break out of local minima.
+- **Deduplicated Multi-Strategy Parallel Trials**: Evaluates 34 strategy and uniform-filter combinations in parallel via `std::async`, deduplicating identical pre-processed variants and filter streams before proxy DEFLATE.
 
 ## CLI Options
 

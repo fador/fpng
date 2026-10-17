@@ -124,7 +124,7 @@ void package_merge_lengths(const uint32_t* freqs, size_t n, int max_bits, uint8_
 // Build standard Huffman tree and apply proper length limiting
 void compute_huffman_lengths(const uint32_t* freqs, size_t n, int max_bits,
                              std::vector<uint8_t>& lengths) {
-    std::fill(lengths.begin(), lengths.end(), 0);
+    std::fill(lengths.begin(), lengths.end(), static_cast<uint8_t>(0));
 
     if (n == 0) return;
     if (n == 1) { lengths[0] = 1; return; }

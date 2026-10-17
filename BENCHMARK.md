@@ -16,11 +16,11 @@ Results below use `fpng -o9 -j4` (maximum quality, 4 threads) compared with `opt
 | Image | Original | fpng | optipng | pngcrush |
 |-------|----------|------|---------|----------|
 | `z00n2c08.png` (zlib level 0, color) | 3,172 | **195** (93.9%) | 223 (93.0%) | 223 (93.0%) |
-| `f00n2c08.png` (filter None, color) | 2,475 | **1,011** (59.2%) | 1,059 (57.2%) | 1,059 (57.2%) |
-| `f02n2c08.png` (filter Sub, color) | 1,729 | **964** (44.2%) | 1,020 (41.0%) | 1,020 (41.0%) |
-| `f99n0g04.png` (filter test) | 426 | **280** (34.3%) | 278 (34.7%) | 278 (34.7%) |
-| `basi4a16.png` (alpha channel, 16-bit) | 2,855 | 2,019 (29.3%) | **1,980** (30.6%) | 1,980 (30.6%) |
-| `exif2c08.png` (with EXIF metadata) | 1,788 | **893** (50.1%) | 1,788 (0.0%) | 796 (55.5%) |
+| `f00n2c08.png` (filter None, color) | 2,475 | **986** (60.2%) | 1,059 (57.2%) | 1,059 (57.2%) |
+| `f02n2c08.png` (filter Sub, color) | 1,729 | **950** (45.1%) | 1,020 (41.0%) | 1,020 (41.0%) |
+| `f99n0g04.png` (filter test) | 426 | **273** (35.9%) | 278 (34.7%) | 278 (34.7%) |
+| `basi4a16.png` (alpha channel, 16-bit) | 2,855 | **1,084** (62.0%) | 1,980 (30.6%) | 1,980 (30.6%) |
+| `exif2c08.png` (with EXIF metadata) | 1,788 | **772** (56.8%) | 1,788 (0.0%) | 796 (55.5%) |
 | `large_web_128x128.png` (128×128 RGBA web graphic) | 41,604 | 1,942 (95.3%) | **694** (98.3%) | 693 (98.3%) |
 
 ### Photographic Images
@@ -35,10 +35,10 @@ Results below use `fpng -o9 -j4` (maximum quality, 4 threads) compared with `opt
 
 | Category | Images | Original Total | fpng Total | Savings |
 |----------|--------|----------------|------------|---------|
-| Filter tests | 11 | 9,739 | 6,946 | **28.7%** |
-| Zlib levels | 4 | 3,852 | 953 | **75.3%** |
-| Basic format | 15 | 11,870 | 11,031 | **7.1%** |
-| All PNGSuite | 30 | 25,461 | 18,930 | **25.6%** |
+| Filter tests | 11 | 9,739 | 6,389 | **34.4%** |
+| Zlib levels | 4 | 3,852 | 780 | **79.8%** |
+| Basic format | 15 | 11,870 | 6,753 | **43.1%** |
+| All PNGSuite | 30 | 25,461 | 13,922 | **45.3%** |
 
 ## Compression Speed
 
@@ -53,11 +53,11 @@ fpng is competitive with optipng on small images and significantly faster on lar
 
 ## Strategy Effectiveness
 
-fpng uses a multi-strategy approach with up to 23 configurations at max level, filtered by content analysis:
+fpng uses a multi-strategy approach with up to 34 configurations + uniform filters at max level, deduplicated by pre-processed image variant and filter stream:
 
 - **Content analysis**: Classifies images as photo/graphic, measures entropy, gradient strength, unique color count
-- **Auto-scaling**: Large images (>256K pixels) get fewer strategies and lower iteration counts
-- **Proxy-compare**: Fast fixed-Huffman proxy runs select top 3 candidates for full dynamic-Huffman re-compress
+- **Variant & filter deduplication**: Collapses identical pre-processed images and identical filter choices before proxy DEFLATE
+- **Proxy-compare**: Dynamic-Huffman proxy runs with exact chunk overhead (`+12` bytes per `PLTE`/`tRNS` chunk) select top candidates for full `Ultra` multi-iteration re-compress
 - **Keep-original**: If output is larger than input, original is preserved
 
 ### Best Strategies by Image Type
@@ -76,7 +76,7 @@ fpng's re-compression matches or improves on the original encoder in most cases.
 ### Round-trip Correctness
 
 - **Self-consistency**: Output can be read back by fpng's own reader — verified for all standard color types and bit depths
-- **30/30 tests passing**: CRC32, all 5 filter types roundtrip, Paeth predictor, stored/fixed/dynamic DEFLATE, multi-block DEFLATE, Huffman optimality, interlaced PNG, zlib compress/decompress
+- **33/33 tests passing**: CRC32, all 5 filter types roundtrip, Paeth predictor, stored/fixed/dynamic DEFLATE, multi-block DEFLATE, Huffman optimality, interlaced PNG, zlib compress/decompress, sub-byte grayscale/indexed packing, palette compaction
 
 ### Changes Since Initial Release
 
@@ -195,24 +195,23 @@ Subsequent compression improvements:
 
 Measured on the bundled corpus (223 images, `-o9 -j4`):
 
-| Metric | Before | After |
-|--------|--------|-------|
-| Outputs with valid round-trip | 90 / 199 | **205 / 205** |
-| Total output | 145,498 B (post-correctness baseline) | **128,513 B (−11.7%)** |
-| Compression ratio (out/in) | 17.35% | **15.33%** |
-| Total time | 782 s | **~133 s** |
-| Failing reads (`basi*`, `s36/38`, `cten*`) | crashes/errors | **fixed** |
+| Metric | Before | Previous Overhaul | Current |
+|--------|--------|-------------------|---------|
+| Outputs with valid round-trip | 90 / 199 | 205 / 205 | **223 / 223** |
+| Total output | 145,498 B | 128,513 B (−11.7%) | **123,022 B (−15.4%)** |
+| Compression ratio (out/in) | 17.35% | 15.33% | **14.67% (−85.33% saved)** |
+| Failing reads (`basi*`, `s36/38`, `cten*`) | crashes/errors | fixed | **fixed (33/33 unit tests)** |
 
-## Latest Benchmark: State-of-the-Art DEFLATE & Filter Optimization
+## Latest Benchmark: State-of-the-Art DEFLATE, Filter & Pre-Processor Optimization
 
-A major algorithmic overhaul introduced six state-of-the-art compression techniques:
+Our latest algorithmic improvements encompass:
 
-1. **Exact Viterbi Trellis Dynamic Programming**: Replaced slow genetic algorithms with an exact 5-state Viterbi DP trellis ($O(25 \times H)$) that solves globally optimal filter combinations in <1ms. Fixed signed residual metric `|int8_t(row[x])|` per PNG specification.
-2. **True Package-Merge Huffman (Larmore & Hirschberg)**: Replaced alphabetic tree DP with true $O(N \cdot L)$ Package-Merge for guaranteed-optimal length-limited codes (15-bit DEFLATE constraint).
-3. **2-Opt TSP Palette Permutation**: Formulated 8-bit palette sorting as a Traveling Salesperson Problem over an adjacent-pixel co-occurrence graph weighted by Euclidean RGB distance. Preserves leading position of non-opaque entries for maximal `tRNS` chunk trimming.
-4. **RFC 1951 Optimal Block Typing**: Exact bit-cost evaluation across Dynamic Huffman, Fixed Huffman, and Stored blocks, emitting whichever is strictly smallest.
-5. **2D Spatial & Diagonal Probing**: Enhanced LZ77 match finding with vertical (`row_stride`) and diagonal ($\text{row\_stride} \pm \Delta$) probing to capture 2D image spatial redundancies, alongside a 3-byte hash chain walk (`prev3_` up to 16 steps).
-6. **Zopfli-Style Squeezing & Best Token Retention**: Iterative forward-DP with deterministic cost perturbations on later iterations (`iter >= 2`) and exact bit-cost tracking to retain the global minimum token stream.
+1. **Exact Viterbi Trellis DP, History-Aware Windowed Trial & Cumulative Cross-Entropy**: Combines exact 5-state Viterbi DP ($O(25 \times H)$ with width-scaled switch penalties), sliding-window trial compression (up to 32 rows / 4 KB of prior filtered scanlines), and rolling cross-entropy with a local 3-byte LZ77 repeat bonus.
+2. **True Package-Merge Huffman & Cross-Alphabet Header RLE**: Guaranteed-optimal length-limited codes (15-bit DEFLATE constraint) plus RFC 1951 Section 3.2.7 cross-alphabet `HLIT`+`HDIST` RLE and exact `HCLEN * 3` header scoring.
+3. **Palette Compaction, Sub-Byte Bit Packing & 2-Opt TSP Permutation**: Prunes unused/duplicate palette entries, packs Indexed (`color_type == 3`) and Grayscale (`color_type == 0`) images down to 1, 2, or 4 bits per pixel, preserves binary `tRNS` across `alpha_optimize` → `reduce_colors`, and orders palettes via 2-Opt TSP over pixel adjacency co-occurrences.
+4. **RFC 1951 Optimal Block Typing & Per-Block Refinement**: Exact bit-cost evaluation across Dynamic Huffman, Fixed Huffman, and Stored blocks, with per-block optimal LZ77 re-parsing after adaptive token-stream splitting.
+5. **1x/2x 2D Spatial Probing & Exact `find_all` Frontier**: Enhanced LZ77 match finding with `1x` and `2x` `row_stride` diagonal probing (`±1..4`), explicit distance `1..4` RLE probing, a 64-step 3-byte hash chain walk, an exact `min_dist_for_len` frontier, and optimal DP tie-breaking.
+6. **Blended Shannon/Huffman Squeezing & Variant Deduplication**: Iterative forward-DP blending continuous Shannon entropy with Package-Merge code lengths, plus multi-strategy variant/filter deduplication and exact `PLTE`/`tRNS` chunk framing overhead (`+12` bytes per chunk) during proxy ranking.
 
 ### Comprehensive Test Suite Comparison
 
@@ -220,39 +219,39 @@ Evaluated on the full PNGSuite, synthetic images, and photographic test set:
 
 | Tool | Compressed Total | Compression Ratio | Rank |
 |------|-----------------|-------------------|:----:|
-| **fpng** | **95,318 B** | **11.9%** | **#1** |
+| **fpng** | **89,830 B** | **11.2%** | **#1** |
 | pngcrush | 102,184 B | 12.8% | #2 |
 | optipng | 100,394 B | 13.4% | #3 |
 
 ### 8-Bit Indexed Colormap Suite (`test_images/*3p08.png`)
 
-With 2-Opt TSP adjacency & RGB distance palette sorting, `fpng` achieves dramatic gains over `pngcrush`:
+With palette compaction, sub-byte bit packing, and 2-Opt TSP adjacency & RGB distance palette sorting, `fpng` achieves dramatic gains over `pngcrush`:
 
 | Image | Original | fpng | pngcrush | Savings vs. pngcrush |
 |---|---:|---:|---:|:---:|
-| `basi3p08.png` | 1,527 B | **916 B** | 1,435 B | **−36.2%** |
-| `basn3p08.png` | 1,263 B | **916 B** | 1,253 B | **−26.9%** |
-| `ccwn3p08.png` | 1,554 B | **1,407 B** | 1,534 B | **−8.3%** |
-| `ch2n3p08.png` | 1,810 B | **916 B** | 1,253 B | **−26.9%** |
-| `cs3n3p08.png` | 259 B | **213 B** | 259 B | **−17.8%** |
+| `basi3p08.png` | 1,527 B | **912 B** | 1,435 B | **−36.4%** |
+| `basn3p08.png` | 1,263 B | **912 B** | 1,253 B | **−27.2%** |
+| `ccwn3p08.png` | 1,554 B | **1,384 B** | 1,534 B | **−9.8%** |
+| `ch2n3p08.png` | 1,810 B | **912 B** | 1,253 B | **−27.2%** |
+| `cs3n3p08.png` | 259 B | **212 B** | 259 B | **−18.1%** |
 | `cs5n3p08.png` | 271 B | **220 B** | 271 B | **−18.8%** |
 | `cs8n3p08.png` | 256 B | **205 B** | 256 B | **−19.9%** |
-| `tbbn3p08.png` | 1,499 B | **1,455 B** | 1,477 B | **−1.5%** |
-| `tbgn3p08.png` | 1,499 B | **1,474 B** | 1,477 B | **−0.2%** |
-| `tbwn3p08.png` | 1,496 B | **1,447 B** | 1,490 B | **−2.9%** |
-| `tbyn3p08.png` | 1,499 B | **1,450 B** | 1,477 B | **−1.8%** |
-| `tp0n3p08.png` | 1,476 B | **1,443 B** | 1,469 B | **−1.8%** |
-| `tp1n3p08.png` | 1,483 B | **1,434 B** | 1,477 B | **−2.9%** |
-| **Indexed Suite Total** | **17,310 B** | **14,657 B (84.7%)** | **16,171 B (93.4%)** | **fpng wins 13 of 13** |
+| `tbbn3p08.png` | 1,499 B | **1,438 B** | 1,477 B | **−2.6%** |
+| `tbgn3p08.png` | 1,499 B | **1,453 B** | 1,477 B | **−1.6%** |
+| `tbwn3p08.png` | 1,496 B | **1,443 B** | 1,490 B | **−3.2%** |
+| `tbyn3p08.png` | 1,499 B | **1,443 B** | 1,477 B | **−2.3%** |
+| `tp0n3p08.png` | 1,476 B | **1,441 B** | 1,469 B | **−1.9%** |
+| `tp1n3p08.png` | 1,483 B | **1,430 B** | 1,477 B | **−3.2%** |
+| **Indexed Suite Total** | **17,310 B** | **14,566 B (84.1%)** | **16,171 B (93.4%)** | **fpng wins 13 of 13** |
 
 ### Synthetic & Geometric Suite
 
 | Image | Original | fpng | pngcrush | Winner |
 |---|---:|---:|---:|:---:|
 | `gradient-32x32.png` | 117 B | **104 B** | 104 B | Tie |
-| `gradient-64x64.png` | 194 B | **139 B** | 139 B | Tie |
-| `gradient-128x128.png` | 461 B | **292 B** | 293 B | **fpng** |
-| `synth_blocks_128x128.png` | 51,939 B | **197 B** | 275 B | **fpng** |
+| `gradient-64x64.png` | 194 B | **138 B** | 139 B | **fpng** |
+| `gradient-128x128.png` | 461 B | **289 B** | 293 B | **fpng** |
+| `synth_blocks_128x128.png` | 51,939 B | **186 B** | 275 B | **fpng** |
 | `synth_gradient_128x128.png` | 6,569 B | **222 B** | 223 B | **fpng** |
 | `synth_gradient_256x256.png` | 26,133 B | **355 B** | 357 B | **fpng** |
 
@@ -272,8 +271,8 @@ sudo apt install optipng pngcrush
 
 ## Notes
 
-1. **Overall Compression Lead**: On the comprehensive test suite, `fpng` achieves an overall compression ratio of 11.9%, outperforming both `pngcrush` (12.8%) and `optipng` (13.4%).
-2. **Indexed Image Excellence**: The 2-Opt TSP palette sorter produces state-of-the-art results for indexed colormap images, beating `pngcrush` across all test files.
-3. **Execution Speed**: Exact Viterbi trellis dynamic programming reduced filter optimization times from tens of seconds to under 1 millisecond per image, while Package-Merge computes optimal prefix codes in microseconds.
+1. **Overall Compression Lead**: On the comprehensive test suite, `fpng` achieves an overall compression ratio of 11.2% (and 14.67% / 123,022 B across the 223-image bundled corpus), outperforming both `pngcrush` (12.8%) and `optipng` (13.4%).
+2. **Indexed Image Excellence**: Palette compaction, sub-byte packing, and the 2-Opt TSP palette sorter produce state-of-the-art results for indexed colormap images, beating `pngcrush` across all test files.
+3. **Execution Speed**: Pre-processed variant and filter stream deduplication eliminate redundant proxy DEFLATE passes, while Viterbi trellis DP and Package-Merge compute optimal filters and prefix codes in sub-millisecond time.
 4. **Safety Guarantee**: `fpng` automatically detects when compression will not reduce file size and keeps the original file unchanged.
-5. **Round-Trip Fidelity**: All outputs are verified through round-trip decoding and pixel validation (30/30 unit tests passing).
+5. **Round-Trip Fidelity**: All outputs are verified through round-trip decoding and pixel validation (33/33 unit tests passing).

@@ -52,7 +52,8 @@ private:
     std::vector<uint8_t> filter_and_compress(const Image& img,
                                               const WriteOptions& wopts);
     std::vector<uint8_t> filter_and_compress_frame(const Image& img,
-                                                     const FrameInfo& finfo);
+                                                     const FrameInfo& finfo,
+                                                     const WriteOptions& wopts);
 
     std::string error_;
 };

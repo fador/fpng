@@ -153,7 +153,7 @@ void PNGWriter::write_idat(std::vector<uint8_t>& out, const Image& img,
             write_chunk(out, "fcTL", {fctl, 26});
 
             // fdAT
-            auto frame_compressed = filter_and_compress_frame(img, f);
+            auto frame_compressed = filter_and_compress_frame(img, f, wopts);
             std::vector<uint8_t> fdat;
             fdat.reserve(4 + frame_compressed.size());
             uint8_t seq_buf[4];
@@ -266,12 +266,24 @@ std::vector<uint8_t> PNGWriter::filter_and_compress(const Image& img,
 }
 
 std::vector<uint8_t> PNGWriter::filter_and_compress_frame(const Image& img,
-                                                            const FrameInfo& finfo) {
+                                                            const FrameInfo& finfo,
+                                                            const WriteOptions& wopts) {
     if (finfo.image_data.empty()) return {};
 
     size_t bpp = img.bytes_per_pixel();
     size_t raw_ss = img.scanline_size_for_width(finfo.width);
     size_t height = finfo.height;
+
+    Image frame_img;
+    frame_img.width = finfo.width;
+    frame_img.height = finfo.height;
+    frame_img.bit_depth = img.bit_depth;
+    frame_img.color_type = img.color_type;
+    frame_img.pixels = finfo.image_data;
+
+    FilterOptions fopts;
+    fopts.level = 2;
+    auto filters = optimize_filters(frame_img, fopts);
 
     std::vector<uint8_t> filtered;
     filtered.reserve((raw_ss + 1) * height);
@@ -281,13 +293,14 @@ std::vector<uint8_t> PNGWriter::filter_and_compress_frame(const Image& img,
 
     for (size_t y = 0; y < height; ++y) {
         const uint8_t* src = finfo.image_data.data() + y * raw_ss;
-        filter_scanline(FilterType::None, src, row_buf.data(), bpp, raw_ss,
+        FilterType ft = (y < filters.size()) ? filters[y] : FilterType::None;
+        filter_scanline(ft, src, row_buf.data(), bpp, raw_ss,
                          y > 0 ? prev_scanline.data() : nullptr);
         filtered.insert(filtered.end(), row_buf.begin(), row_buf.end());
         std::memcpy(prev_scanline.data(), src, raw_ss);
     }
 
-    DeflateOptions deflate;
+    DeflateOptions deflate = wopts.deflate;
     if (raw_ss + 1 <= INT_MAX) deflate.row_stride = static_cast<int>(raw_ss + 1);
     return zlib_compress(filtered, deflate);
 }

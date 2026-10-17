@@ -188,4 +188,64 @@ void test_full_compress_pipeline() {
             run_test("compress() visual content matches", ok);
         }
     }
+
+    // Test level 9 compression with color reduction + sub-byte packing (4-color image -> 2-bit indexed)
+    {
+        CompressOptions copts9;
+        copts9.level = 9;
+        copts9.multi_strategy = true;
+        copts9.num_threads = 2;
+
+        CompressResult res9 = compress(img, copts9);
+        PNGReader reader;
+        auto dec9 = reader.read(res9.data);
+        bool ok9 = dec9.has_value() && res9.data.size() <= res.data.size();
+        run_test("compress() level 9 <= level 5 size and valid", ok9);
+    }
+
+    // Test 8-bit grayscale -> 1-bit grayscale sub-byte packing
+    {
+        Image gimg;
+        gimg.width = 32;
+        gimg.height = 32;
+        gimg.bit_depth = 8;
+        gimg.color_type = 0;
+        gimg.pixels.resize(32 * 32);
+        for (size_t i = 0; i < gimg.pixels.size(); ++i) {
+            size_t x = i % 32, y = i / 32;
+            gimg.pixels[i] = ((x * 7 + y * 13 + (x ^ y)) % 5 < 2) ? 0 : 255;
+        }
+        CompressOptions copts9;
+        copts9.level = 9;
+        CompressResult gres = compress(gimg, copts9);
+        PNGReader reader;
+        auto gdec = reader.read(gres.data);
+        bool gok = gdec.has_value() && gdec->width == 32 && gdec->height == 32 && gdec->bit_depth == 1;
+        run_test("8-bit binary grayscale packs to 1-bit grayscale", gok);
+    }
+
+    // Test 8-bit indexed with duplicate/unused entries -> compacted sub-byte indexed
+    {
+        Image pimg;
+        pimg.width = 16;
+        pimg.height = 16;
+        pimg.bit_depth = 8;
+        pimg.color_type = 3;
+        // 10 palette entries, only indices 2, 5, 7 used, where 2 and 7 are identical RGB
+        pimg.palette.resize(30, 0);
+        pimg.palette[2 * 3 + 0] = 255; pimg.palette[2 * 3 + 1] = 0;   pimg.palette[2 * 3 + 2] = 0;
+        pimg.palette[5 * 3 + 0] = 0;   pimg.palette[5 * 3 + 1] = 255; pimg.palette[5 * 3 + 2] = 0;
+        pimg.palette[7 * 3 + 0] = 255; pimg.palette[7 * 3 + 1] = 0;   pimg.palette[7 * 3 + 2] = 0;
+        pimg.pixels.resize(16 * 16);
+        for (size_t i = 0; i < pimg.pixels.size(); ++i) {
+            pimg.pixels[i] = (i % 3 == 0) ? 2 : ((i % 3 == 1) ? 5 : 7);
+        }
+        CompressOptions copts9;
+        copts9.level = 9;
+        CompressResult pres = compress(pimg, copts9);
+        PNGReader reader;
+        auto pdec = reader.read(pres.data);
+        bool pok = pdec.has_value() && pdec->bit_depth == 1 && pdec->palette.size() == 6;
+        run_test("8-bit indexed compacts duplicates/unused to 1-bit 2-color PLTE", pok);
+    }
 }

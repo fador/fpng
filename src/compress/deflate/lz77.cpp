@@ -73,12 +73,12 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
 
     LZMatch best{0, 0};
 
-    // Length-3 candidate from the 3-byte index. Walk chain up to 16 steps
-    // to find nearest valid 3-byte match (replaces single-candidate check).
+    // Length-3 candidate from the 3-byte index. Walk chain up to 64 steps
+    // to find nearest valid 3-byte match.
     if (pos + 3 <= size_) {
         int32_t p3 = prev3_[pos];
         int steps = 0;
-        while (p3 >= 0 && steps < 16) {
+        while (p3 >= 0 && steps < 64) {
             size_t cand = static_cast<size_t>(p3);
             if (cand >= pos) break;
             size_t dist = pos - cand;
@@ -158,20 +158,24 @@ LZMatch MatchFinder::find_longest(size_t pos, int /*min_len*/) const {
         }
     }
 
-    // Row-stride and diagonal 2D spatial probes (stride, stride-4, stride+4, stride-3, stride+3)
+    // Row-stride and diagonal 2D spatial probes (1x and 2x row_stride)
     if (row_stride > 0 && best.length < static_cast<size_t>(nice_len)) {
-        int d_offsets[] = {0, -4, 4, -3, 3, -1, 1};
-        for (int doff : d_offsets) {
-            int d = row_stride + doff;
-            if (d > 0 && pos >= static_cast<size_t>(d) && static_cast<size_t>(d) <= limit) {
-                size_t row_pos = pos - static_cast<size_t>(d);
-                size_t mlen = simd::match_length(data_ + row_pos, cur, max_match);
-                if (mlen >= 4) {
-                    int new_score = score(mlen, d);
-                    int best_score = score(best.length, best.distance);
-                    if (new_score > best_score) {
-                        best.length = static_cast<uint16_t>(mlen);
-                        best.distance = static_cast<uint16_t>(d);
+        int d_offsets[] = {0, -4, 4, -3, 3, -2, 2, -1, 1};
+        for (int mult = 1; mult <= 2; ++mult) {
+            int base_stride = row_stride * mult;
+            for (int doff : d_offsets) {
+                int d = base_stride + doff;
+                if (d > 0 && pos >= static_cast<size_t>(d) && static_cast<size_t>(d) <= limit) {
+                    size_t row_pos = pos - static_cast<size_t>(d);
+                    size_t mlen = simd::match_length(data_ + row_pos, cur, max_match);
+                    if (mlen >= static_cast<size_t>(deflate::MIN_MATCH_LEN)) {
+                        int new_score = score(mlen, d);
+                        int best_score = score(best.length, best.distance);
+                        if (new_score > best_score ||
+                            (new_score == best_score && static_cast<uint16_t>(d) < best.distance)) {
+                            best.length = static_cast<uint16_t>(mlen);
+                            best.distance = static_cast<uint16_t>(d);
+                        }
                     }
                 }
             }
@@ -190,24 +194,62 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
     size_t limit = std::min(pos, size_t(deflate::MAX_DIST));
     size_t max_match = std::min(size_ - pos, size_t(deflate::MAX_MATCH_LEN));
 
-    // 1. Run-length check for distance 1 (identical bytes, most compressible)
-    if (pos >= 1 && data_[pos - 1] == data_[pos]) {
-        size_t run = 1;
-        while (pos + run < size_ && run < max_match && data_[pos + run] == data_[pos])
-            ++run;
-        if (run >= static_cast<size_t>(deflate::MIN_MATCH_LEN)) {
-            for (size_t L = deflate::MIN_MATCH_LEN; L <= run; ++L) {
-                matches.push_back({static_cast<uint16_t>(L), 1});
+    // Helper to record or improve the minimum distance for length L.
+    // `matches` is maintained sorted by length starting at MIN_MATCH_LEN (3)
+    // whenever possible, or updated in-place.
+    uint16_t min_dist_for_len[deflate::MAX_MATCH_LEN + 1];
+    std::fill(std::begin(min_dist_for_len), std::end(min_dist_for_len), uint16_t(0));
+    size_t max_found_len = 0;
+
+    auto record_match = [&](size_t mlen, uint16_t dist) {
+        if (mlen > max_match) mlen = max_match;
+        if (mlen < static_cast<size_t>(deflate::MIN_MATCH_LEN)) return;
+        for (size_t L = deflate::MIN_MATCH_LEN; L <= mlen; ++L) {
+            if (min_dist_for_len[L] == 0 || dist < min_dist_for_len[L]) {
+                min_dist_for_len[L] = dist;
+            }
+        }
+        if (mlen > max_found_len) max_found_len = mlen;
+    };
+
+    // 1. Run-length / periodic check for distances 1, 2, 3, 4
+    for (size_t d = 1; d <= 4; ++d) {
+        if (pos >= d && d <= limit && pos + 3 <= size_) {
+            if (data_[pos - d] == cur[0] &&
+                data_[pos - d + 1] == cur[1] &&
+                data_[pos - d + 2] == cur[2]) {
+                size_t run = 3 + simd::match_length(data_ + pos - d + 3, cur + 3, max_match - 3);
+                record_match(run, static_cast<uint16_t>(d));
+                if (d == 1 && run >= max_match) break;
             }
         }
     }
 
-    // 2. 4-byte tag matches
-    if (pos + 4 <= size_) {
+    // 2. Length-3 nearest match from the 3-byte index. Walk chain up to 64 steps.
+    if (min_dist_for_len[3] > 1 || min_dist_for_len[3] == 0) {
+        int32_t p3 = prev3_[pos];
+        int steps = 0;
+        while (p3 >= 0 && steps < 64) {
+            size_t cand = static_cast<size_t>(p3);
+            if (cand >= pos) break;
+            size_t dist = pos - cand;
+            if (dist > limit) break;
+            if (data_[cand] == cur[0] &&
+                data_[cand + 1] == cur[1] &&
+                data_[cand + 2] == cur[2]) {
+                record_match(deflate::MIN_MATCH_LEN, static_cast<uint16_t>(dist));
+                break;
+            }
+            p3 = prev3_[cand];
+            ++steps;
+        }
+    }
+
+    // 3. 4-byte tag matches (sorted descending by pos -> strictly increasing dist)
+    if (pos + 4 <= size_ && max_found_len < max_match) {
         uint32_t tag;
         std::memcpy(&tag, cur, 4);
 
-        // Binary search for matching tag
         uint32_t hi = tag >> 16;
         int32_t lo = first_[hi];
         int32_t hi_end = first_[hi + 1];
@@ -238,7 +280,7 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
             found = a;
 
             size_t scanned = 0;
-            size_t best_len = matches.empty() ? (deflate::MIN_MATCH_LEN - 1) : matches.back().length;
+            size_t best_tag_len = 3;
             while (found < tag_end && scanned < chain_depth * 2) {
                 size_t candidate = static_cast<size_t>(sorted_[found].pos);
                 ++found;
@@ -247,11 +289,18 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
 
                 size_t match_len = simd::match_length(data_ + candidate + 4, cur + 4,
                                                        max_match - 4) + 4;
-                if (match_len > best_len) {
-                    for (size_t L = best_len + 1; L <= match_len; ++L)
-                        matches.push_back({static_cast<uint16_t>(L),
-                                           static_cast<uint16_t>(dist)});
-                    best_len = match_len;
+                if (match_len > best_tag_len) {
+                    uint16_t d16 = static_cast<uint16_t>(dist);
+                    for (size_t L = best_tag_len + 1; L <= match_len; ++L) {
+                        if (min_dist_for_len[L] == 0 || d16 < min_dist_for_len[L]) {
+                            min_dist_for_len[L] = d16;
+                        }
+                    }
+                    if (min_dist_for_len[3] == 0 || d16 < min_dist_for_len[3]) {
+                        min_dist_for_len[3] = d16;
+                    }
+                    best_tag_len = match_len;
+                    if (match_len > max_found_len) max_found_len = match_len;
                     if (match_len >= max_match) break;
                 }
                 ++scanned;
@@ -259,56 +308,31 @@ void MatchFinder::find_all(size_t pos, std::vector<LZMatch>& matches,
         }
     }
 
-    // 3. Row-stride and diagonal 2D spatial probes (stride, stride-4, stride+4, stride-3, stride+3)
+    // 4. Row-stride and diagonal 2D spatial probes (1x and 2x row_stride)
     if (row_stride > 0) {
-        int d_offsets[] = {0, -4, 4, -3, 3, -1, 1};
-        for (int doff : d_offsets) {
-            int d = row_stride + doff;
-            if (d > 0 && pos >= static_cast<size_t>(d) && static_cast<size_t>(d) <= limit) {
-                size_t row_pos = pos - static_cast<size_t>(d);
-                size_t mlen = simd::match_length(data_ + row_pos, cur, max_match);
-                if (mlen >= static_cast<size_t>(deflate::MIN_MATCH_LEN)) {
-                    uint16_t rdist = static_cast<uint16_t>(d);
-                    for (size_t L = deflate::MIN_MATCH_LEN; L <= mlen; ++L) {
-                        size_t idx = L - deflate::MIN_MATCH_LEN;
-                        if (idx < matches.size()) {
-                            if (rdist < matches[idx].distance) {
-                                matches[idx].distance = rdist;
-                            }
-                        } else {
-                            matches.push_back({static_cast<uint16_t>(L), rdist});
-                        }
+        int d_offsets[] = {0, -4, 4, -3, 3, -2, 2, -1, 1};
+        for (int mult = 1; mult <= 2; ++mult) {
+            int base_stride = row_stride * mult;
+            for (int doff : d_offsets) {
+                int d = base_stride + doff;
+                if (d > 0 && pos >= static_cast<size_t>(d) && static_cast<size_t>(d) <= limit) {
+                    size_t row_pos = pos - static_cast<size_t>(d);
+                    size_t mlen = simd::match_length(data_ + row_pos, cur, max_match);
+                    if (mlen >= static_cast<size_t>(deflate::MIN_MATCH_LEN)) {
+                        record_match(mlen, static_cast<uint16_t>(d));
                     }
                 }
             }
         }
     }
 
-    // 4. Length-3 nearest match from the 3-byte index. Walk chain up to 16 steps.
-    {
-        int32_t p3 = prev3_[pos];
-        int steps = 0;
-        while (p3 >= 0 && steps < 16) {
-            size_t cand = static_cast<size_t>(p3);
-            if (cand >= pos) break;
-            size_t dist = pos - cand;
-            if (dist > limit) break;
-            if (data_[cand] == data_[pos] &&
-                data_[cand + 1] == data_[pos + 1] &&
-                data_[cand + 2] == data_[pos + 2]) {
-                uint16_t dist3 = static_cast<uint16_t>(dist);
-                if (!matches.empty() &&
-                    matches.front().length == deflate::MIN_MATCH_LEN) {
-                    if (dist3 < matches.front().distance)
-                        matches.front().distance = dist3;
-                } else {
-                    matches.insert(matches.begin(),
-                                   {deflate::MIN_MATCH_LEN, dist3});
-                }
-                break;
-            }
-            p3 = prev3_[cand];
-            ++steps;
+    // Emit all achievable lengths [3..max_found_len] with their minimum distances.
+    // Skip intermediate lengths that share the exact same distance AND length_code
+    // and have >0 extra length bits only if they cannot reduce cost, or emit all
+    // so parse_optimal can reach every position cleanly.
+    for (size_t L = deflate::MIN_MATCH_LEN; L <= max_found_len; ++L) {
+        if (min_dist_for_len[L] > 0) {
+            matches.push_back({static_cast<uint16_t>(L), min_dist_for_len[L]});
         }
     }
 }
@@ -510,7 +534,12 @@ std::vector<LZ77Parser::Token> LZ77Parser::parse_optimal(
             uint64_t c = cost[li] +
                          opts.cost_model.match_cost(static_cast<uint16_t>(mlen),
                                                     m.distance);
-            if (c < cost[nli]) {
+            if (c < cost[nli] ||
+                (c == cost[nli] &&
+                 (is_literal[nli] ||
+                  static_cast<int>(mlen) > prev_match_len[nli] ||
+                  (static_cast<int>(mlen) == prev_match_len[nli] &&
+                   m.distance < prev_match_dist[nli])))) {
                 cost[nli] = c;
                 prev_match_len[nli] = static_cast<int>(mlen);
                 prev_match_dist[nli] = m.distance;

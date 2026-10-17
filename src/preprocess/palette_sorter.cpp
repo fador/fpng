@@ -40,7 +40,8 @@ void sort_palette(Image& img) {
             }
         }
 
-        // Sort by descending frequency; break ties by luminance.
+        // Sort by non-opaque first (to allow tRNS trailing trim), then descending
+        // frequency; break ties by luminance.
         std::vector<size_t> order(num_colors);
         for (size_t i = 0; i < num_colors; ++i) order[i] = i;
         std::vector<double> lum(num_colors);
@@ -49,6 +50,9 @@ void sort_palette(Image& img) {
             lum[i] = 0.299 * r + 0.587 * g + 0.114 * b;
         }
         std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            bool a_trans = (a < img.alpha_palette.size() && img.alpha_palette[a] < 255);
+            bool b_trans = (b < img.alpha_palette.size() && img.alpha_palette[b] < 255);
+            if (a_trans != b_trans) return a_trans > b_trans;
             if (freq[a] != freq[b]) return freq[a] > freq[b];
             return lum[a] < lum[b];
         });
@@ -69,8 +73,15 @@ void sort_palette(Image& img) {
                 new_alpha[i] = img.alpha_palette[src];
         }
         img.palette = std::move(new_palette);
-        if (!img.alpha_palette.empty())
+        if (!img.alpha_palette.empty()) {
+            while (!new_alpha.empty() && new_alpha.back() == 255)
+                new_alpha.pop_back();
             img.alpha_palette = std::move(new_alpha);
+        }
+        if (img.ancillary.bKGD && img.ancillary.bKGD->size() == 1) {
+            uint8_t bi = (*img.ancillary.bKGD)[0];
+            if (bi < perm.size()) (*img.ancillary.bKGD)[0] = perm[bi];
+        }
 
         // Remap pixels.
         for (size_t y = 0; y < img.height; ++y) {
@@ -229,6 +240,10 @@ void sort_palette(Image& img) {
             new_alpha.pop_back();
         }
         img.alpha_palette = std::move(new_alpha);
+    }
+    if (img.ancillary.bKGD && img.ancillary.bKGD->size() == 1) {
+        uint8_t bi = (*img.ancillary.bKGD)[0];
+        if (bi < perm.size()) (*img.ancillary.bKGD)[0] = perm[bi];
     }
 
     // Remap pixels (packed bit depths store multiple indices per byte)
