@@ -22,7 +22,7 @@ fpng -s input.png                 # single-strategy (faster)
 | **Filter Opt** | Exact 5-state Viterbi DP ($O(25 \times H)$, <1ms), History-Aware Windowed Trial, Cumulative Cross-Entropy + LZ Bonus, MinSum & Shannon Entropy |
 | **Pre-process** | Alpha-zeroing, color type reduction, sub-byte packing (1/2/4-bit gray & indexed), palette compaction, 2-Opt TSP palette sorting, lossless 16→8 bit depth |
 | **Multi-strategy** | Parallel trials via `std::async` with variant/filter stream deduplication across 34 strategy & uniform-filter configurations |
-| **Safety** | Automatically keeps original if compression doesn't reduce size |
+| **Safety** | Every output is decoded and compared pixel-by-pixel with the input before it is written (atomic temp-file + rename); falls back to a conservative encoder, and keeps the original if nothing verifies or nothing is smaller |
 | **Dependencies** | None — pure C++20 standard library |
 
 ## Build
@@ -115,6 +115,23 @@ For each scanline, choose from 5 PNG filter types:
 - Single IDAT chunk for maximum compression
 - Ancillary chunks preserved or stripped based on options
 - Validates output by re-reading and comparing pixels
+
+## Robustness
+
+Real-world files are messy, so the reader is strict only where an error would change pixels:
+
+| Input problem | Behaviour |
+|---|---|
+| CRC error in a critical chunk, invalid filter byte, corrupt/truncated zlib data, Adler-32 mismatch | Error (exit code 2), original untouched |
+| CRC error or invalid length in an ancillary chunk, data after `IEND`, missing `IEND` after complete image data, non-consecutive `IDAT`s, over-long `tRNS`, palette indices beyond `PLTE` | Repaired, reported as a warning |
+| Unknown critical chunk | Error (cannot be safely re-encoded) |
+| `eXIf` and unknown safe-to-copy chunks | Preserved at their original position |
+| Hostile sizes / zip bombs | Decompression bounded by the size implied by `IHDR`; images over 4 GiB raw are rejected |
+| APNG | Frames, timing, disposal/blend ops preserved; sequence numbers renumbered |
+
+Colour-dependent chunks (`sBIT`, `bKGD`, `tRNS`) are rewritten for the reduced colour type or dropped if they cannot be represented, so the output never contradicts `IHDR`. Non-ASCII file names work on Windows (UTF-16 command line).
+
+Exit codes: `0` written or original kept, `1` usage error, `2` input unreadable, `3` output not writable.
 
 ## Optimization Levels
 

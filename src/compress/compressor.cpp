@@ -9,6 +9,9 @@
 #include "preprocess/color_reducer.hpp"
 #include "preprocess/content_analyzer.hpp"
 #include "util/timer.hpp"
+#include "image/compare.hpp"
+
+#include <stdexcept>
 
 #include <algorithm>
 #include <thread>
@@ -29,6 +32,7 @@ void apply_strip_ancillary(Image& img, bool strip_ancillary, bool keep_color_inf
     img.ancillary.tIME.reset();
     img.ancillary.sBIT.reset();
     img.ancillary.text_chunks.clear();
+    img.ancillary.other_chunks.clear();
     if (!keep_color_info) {
         img.ancillary.gAMA.reset();
         img.ancillary.cHRM.reset();
@@ -82,6 +86,30 @@ std::vector<uint8_t> build_filtered_stream(const Image& work,
         std::memcpy(prev.data(), src, raw_ss);
     }
     return filtered_data;
+}
+
+// Run fn(i) for i in [0, n) on up to `threads` workers that pull indices from
+// a shared counter. Unlike fixed batches of `threads` futures, a worker that
+// finishes early immediately takes the next job, so one slow job no longer
+// idles the other cores until the whole batch completes. Results must be
+// written by index, so the output does not depend on scheduling.
+template <class Fn>
+void parallel_for(size_t n, int threads, Fn&& fn) {
+    if (n == 0) return;
+    size_t workers = std::min(n, static_cast<size_t>(std::max(1, threads)));
+    if (workers == 1) {
+        for (size_t i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    std::atomic<size_t> next{0};
+    auto work = [&]() {
+        for (size_t i; (i = next.fetch_add(1)) < n;) fn(i);
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(workers - 1);
+    for (size_t t = 1; t < workers; ++t) pool.emplace_back(work);
+    work();
+    for (auto& th : pool) th.join();
 }
 
 } // namespace
@@ -170,7 +198,7 @@ std::vector<Strategy> get_strategies(int level) {
 std::vector<uint8_t> run_strategy(const Image& img, const Strategy& s) {
     Image work = img;
 
-    bool multi_frame = (img.is_animated && img.frames.size() > 1);
+    bool multi_frame = (img.is_animated && !img.frames.empty());
     if (!multi_frame) {
         if (s.alpha_zero) {
             alpha_optimize(work);
@@ -207,7 +235,7 @@ CompressResult compress_single(const Image& img, const CompressOptions& opts) {
     Image work = img;
     apply_strip_ancillary(work, opts.strip_ancillary, opts.keep_color_info);
 
-    bool multi_frame = (work.is_animated && work.frames.size() > 1);
+    bool multi_frame = (work.is_animated && !work.frames.empty());
     if (!multi_frame) {
         if (work.color_type == 6 || work.color_type == 4 || work.color_type == 3)
             alpha_optimize(work);
@@ -264,10 +292,7 @@ CompressResult compress_single(const Image& img, const CompressOptions& opts) {
     return result;
 }
 
-CompressResult compress(const Image& img_in, const CompressOptions& opts) {
-    if (!opts.multi_strategy || opts.level <= 0) {
-        return compress_single(img_in, opts);
-    }
+CompressResult compress_multi(const Image& img_in, const CompressOptions& opts) {
 
     Timer total;
 
@@ -281,7 +306,7 @@ CompressResult compress(const Image& img_in, const CompressOptions& opts) {
     auto strategies = get_strategies(opts.level);
     bool is_large  = (raw_pixels >= 262144);
     bool is_huge   = (raw_pixels >= 1048576);
-    bool multi_frame = (img.is_animated && img.frames.size() > 1);
+    bool multi_frame = (img.is_animated && !img.frames.empty());
 
     // Filter strategies based on content and size
     std::vector<Strategy> filtered;
@@ -356,12 +381,22 @@ CompressResult compress(const Image& img_in, const CompressOptions& opts) {
     };
     std::vector<FilterJob> filter_jobs;
 
+    // optimize_filters() output depends only on this key: levels 3 and 4 both
+    // run the windowed trial with window_size = min(3, level) = 3, and 5/6
+    // share the same Viterbi penalty. Jobs with the same key on the same
+    // variant would produce identical filter vectors (later deduplicated as
+    // candidates, keeping the first), so compute them once.
+    auto filter_key = [](int level) {
+        if (level == 4) return 3;
+        if (level == 6) return 5;
+        return level;
+    };
     for (const auto& s : filtered) {
         size_t v_idx = get_or_create_variant(s.alpha_zero, s.color_reduce, s.palette_sort);
         bool exists = false;
         for (const auto& fj : filter_jobs) {
             if (!fj.is_uniform && fj.variant_idx == v_idx &&
-                fj.strategy.filter_level == s.filter_level) {
+                filter_key(fj.strategy.filter_level) == filter_key(s.filter_level)) {
                 exists = true;
                 break;
             }
@@ -400,36 +435,25 @@ CompressResult compress(const Image& img_in, const CompressOptions& opts) {
 
     // Step 2: Compute filter vectors for all jobs in parallel
     std::vector<std::vector<FilterType>> job_filters(filter_jobs.size());
-    {
-        int f_threads = std::min(threads, static_cast<int>(filter_jobs.size()));
-        for (size_t batch_start = 0; batch_start < filter_jobs.size(); batch_start += f_threads) {
-            size_t batch_end = std::min(batch_start + static_cast<size_t>(f_threads), filter_jobs.size());
-            std::vector<std::future<std::vector<FilterType>>> futures;
-            for (size_t ji = batch_start; ji < batch_end; ++ji) {
-                futures.push_back(std::async(std::launch::async, [&, ji]() {
-                    const auto& job = filter_jobs[ji];
-                    const Image& work = variants[job.variant_idx].work;
-                    if (job.is_uniform) {
-                        return std::vector<FilterType>(work.height, job.uniform_type);
-                    }
-                    FilterOptions fopts;
-                    fopts.level = job.strategy.filter_level;
-                    fopts.window_size = std::min(3, std::max(1, job.strategy.filter_level));
-                    if (is_huge || is_large) {
-                        fopts.ga_population = std::min(job.strategy.filter_level, 5);
-                        fopts.ga_generations = std::min(job.strategy.filter_level, 10);
-                    } else {
-                        fopts.ga_population = std::min(job.strategy.filter_level * 5, 20);
-                        fopts.ga_generations = std::min(job.strategy.filter_level * 5, 30);
-                    }
-                    return optimize_filters(work, fopts);
-                }));
-            }
-            for (size_t ji = batch_start; ji < batch_end; ++ji) {
-                job_filters[ji] = futures[ji - batch_start].get();
-            }
+    parallel_for(filter_jobs.size(), threads, [&](size_t ji) {
+        const auto& job = filter_jobs[ji];
+        const Image& work = variants[job.variant_idx].work;
+        if (job.is_uniform) {
+            job_filters[ji] = std::vector<FilterType>(work.height, job.uniform_type);
+            return;
         }
-    }
+        FilterOptions fopts;
+        fopts.level = job.strategy.filter_level;
+        fopts.window_size = std::min(3, std::max(1, job.strategy.filter_level));
+        if (is_huge || is_large) {
+            fopts.ga_population = std::min(job.strategy.filter_level, 5);
+            fopts.ga_generations = std::min(job.strategy.filter_level, 10);
+        } else {
+            fopts.ga_population = std::min(job.strategy.filter_level * 5, 20);
+            fopts.ga_generations = std::min(job.strategy.filter_level * 5, 30);
+        }
+        job_filters[ji] = optimize_filters(work, fopts);
+    });
 
     // Step 3: Deduplicate (variant_idx, filters) so identical filtered scanlines
     // are never proxy-compressed twice.
@@ -466,49 +490,39 @@ CompressResult compress(const Image& img_in, const CompressOptions& opts) {
     // Step 4: Proxy-compress all unique candidates in parallel
     struct TrialResult {
         size_t candidate_idx;
-        std::vector<uint8_t> filtered_data;
         std::vector<uint8_t> zlib_data;
         size_t proxy_total_size;
     };
 
     std::vector<TrialResult> results(candidates.size());
-    {
-        int p_threads = std::min(threads, static_cast<int>(candidates.size()));
-        for (size_t batch_start = 0; batch_start < candidates.size(); batch_start += p_threads) {
-            size_t batch_end = std::min(batch_start + static_cast<size_t>(p_threads), candidates.size());
-            std::vector<std::future<TrialResult>> futures;
-            for (size_t ci = batch_start; ci < batch_end; ++ci) {
-                futures.push_back(std::async(std::launch::async, [&, ci]() {
-                    const auto& cand = candidates[ci];
-                    const auto& var = variants[cand.variant_idx];
-                    const Image& work = var.work;
-                    size_t raw_ss = work.raw_scanline_size();
+    parallel_for(candidates.size(), threads, [&](size_t ci) {
+        const auto& cand = candidates[ci];
+        const auto& var = variants[cand.variant_idx];
+        const Image& work = var.work;
+        size_t raw_ss = work.raw_scanline_size();
 
-                    TrialResult tr;
-                    tr.candidate_idx = ci;
-                    tr.filtered_data = build_filtered_stream(work, cand.filters);
+        TrialResult tr;
+        tr.candidate_idx = ci;
+        // The filtered stream is only needed for this proxy pass; keeping it
+        // in every TrialResult held one full copy of the image per candidate.
+        std::vector<uint8_t> filtered_data = build_filtered_stream(work, cand.filters);
 
-                    DeflateOptions dopts;
-                    dopts.level = (opts.level <= 3) ? cand.strategy.deflate_level : CompressionLevel::Best;
-                    dopts.iterations = 1;
-                    dopts.adaptive_blocks = !is_huge;
-                    dopts.chain_depth = 0;
-                    dopts.max_block_size = 65536;
-                    dopts.row_stride = static_cast<int>(raw_ss + 1);
+        DeflateOptions dopts;
+        dopts.level = (opts.level <= 3) ? cand.strategy.deflate_level : CompressionLevel::Best;
+        dopts.iterations = 1;
+        dopts.adaptive_blocks = !is_huge;
+        dopts.chain_depth = 0;
+        dopts.max_block_size = 65536;
+        dopts.row_stride = static_cast<int>(raw_ss + 1);
 
-                    tr.zlib_data = zlib_compress(tr.filtered_data, dopts);
-                    tr.proxy_total_size = tr.zlib_data.size() + var.chunk_overhead;
-                    return tr;
-                }));
-            }
-            for (size_t ci = batch_start; ci < batch_end; ++ci) {
-                results[ci] = futures[ci - batch_start].get();
-                if (opts.verbose) {
-                    std::cout << "  Proxy " << candidates[ci].strategy.name
-                              << ": " << results[ci].proxy_total_size << " bytes\n";
-                }
-            }
-        }
+        tr.zlib_data = zlib_compress(filtered_data, dopts);
+        tr.proxy_total_size = tr.zlib_data.size() + var.chunk_overhead;
+        results[ci] = std::move(tr);
+    });
+    if (opts.verbose) {
+        for (size_t ci = 0; ci < results.size(); ++ci)
+            std::cout << "  Proxy " << candidates[ci].strategy.name
+                      << ": " << results[ci].proxy_total_size << " bytes\n";
     }
 
     std::sort(results.begin(), results.end(),
@@ -552,86 +566,149 @@ CompressResult compress(const Image& img_in, const CompressOptions& opts) {
         std::string name;
     };
     std::vector<FinalCandidate> finals(recompress_count);
+    parallel_for(recompress_count, threads, [&](size_t ri) {
+        const auto& tr = results[ri];
+        const auto& cand = candidates[tr.candidate_idx];
+        const Image& work = variants[cand.variant_idx].work;
+        const Strategy& strat = cand.strategy;
 
-    {
-        int r_threads = std::min(threads, static_cast<int>(recompress_count));
-        for (size_t batch_start = 0; batch_start < recompress_count; batch_start += r_threads) {
-            size_t batch_end = std::min(batch_start + static_cast<size_t>(r_threads), recompress_count);
-            std::vector<std::future<FinalCandidate>> futures;
-            for (size_t ri = batch_start; ri < batch_end; ++ri) {
-                futures.push_back(std::async(std::launch::async, [&, ri]() {
-                    const auto& tr = results[ri];
-                    const auto& cand = candidates[tr.candidate_idx];
-                    const Image& work = variants[cand.variant_idx].work;
-                    const Strategy& strat = cand.strategy;
+        DeflateOptions dopts;
+        dopts.level = strat.deflate_level;
+        dopts.iterations = strat.deflate_iterations;
+        dopts.adaptive_blocks = true;
+        dopts.row_stride = static_cast<int>(work.raw_scanline_size() + 1);
+        if (is_huge) {
+            // Cap (never raise) the optimal-parse effort on big images. The
+            // old code forced 5 iterations at Best even for -o 1..3, which made
+            // ordinary screenshots take minutes at the "fast" levels.
+            int cap = (raw_pixels <= 2621440) ? 5 : (raw_pixels <= 10485760) ? 3 : 2;
+            dopts.iterations = std::min(dopts.iterations, cap);
+            if (opts.level >= 7 && dopts.level < CompressionLevel::Best)
+                dopts.level = CompressionLevel::Best;
+        } else if (is_large) {
+            dopts.iterations = std::min(dopts.iterations, 4);
+        }
+        dopts.chain_depth = 0;
 
-                    DeflateOptions dopts;
-                    dopts.level = strat.deflate_level;
-                    dopts.iterations = strat.deflate_iterations;
-                    dopts.adaptive_blocks = true;
-                    dopts.row_stride = static_cast<int>(work.raw_scanline_size() + 1);
-                    if (is_huge) {
-                        dopts.iterations = (raw_pixels <= 2621440) ? 5
-                                         : (raw_pixels <= 10485760) ? 3 : 2;
-                        if (dopts.level < CompressionLevel::Best)
-                            dopts.level = CompressionLevel::Best;
-                    } else if (is_large) {
-                        dopts.iterations = std::min(dopts.iterations, 4);
-                    }
-                    dopts.chain_depth = 0;
+        // If full settings exceed proxy settings, re-compress the already-filtered stream
+        WriteOptions wopts;
+        wopts.filters = cand.filters;
+        wopts.deflate = dopts;
 
-                    // If full settings exceed proxy settings, re-compress the already-filtered stream
-                    WriteOptions wopts;
-                    wopts.filters = cand.filters;
-                    wopts.deflate = dopts;
+        PNGWriter writer;
+        auto png_out = writer.write(work, wopts);
 
-                    PNGWriter writer;
-                    auto png_out = writer.write(work, wopts);
-
-                    // Also check if the proxy's 1-iteration stream was somehow smaller
-                    if (dopts.level != CompressionLevel::Best || dopts.iterations > 1) {
-                        WriteOptions pwopts;
-                        pwopts.filters = cand.filters;
-                        pwopts.deflate.level = CompressionLevel::Best;
-                        pwopts.deflate.iterations = 1;
-                        pwopts.deflate.adaptive_blocks = !is_huge;
-                        pwopts.deflate.max_block_size = 65536;
-                        pwopts.deflate.row_stride = static_cast<int>(work.raw_scanline_size() + 1);
-                        // Only build proxy PNG if proxy zlib + chunk overhead could beat png_out
-                        if (tr.proxy_total_size + 57 < png_out.size()) {
-                            auto proxy_png = writer.write(work, pwopts);
-                            if (proxy_png.size() < png_out.size()) {
-                                png_out = std::move(proxy_png);
-                            }
-                        }
-                    }
-
-                    return FinalCandidate{std::move(png_out), strat.name + "-actual"};
-                }));
-            }
-            for (size_t ri = batch_start; ri < batch_end; ++ri) {
-                finals[ri] = futures[ri - batch_start].get();
-                if (opts.verbose) {
-                    std::cout << "  Actual " << finals[ri].name << ": "
-                              << finals[ri].png_data.size() << " bytes PNG\n";
+        // Also check if the proxy's 1-iteration stream was somehow smaller
+        if (dopts.level != CompressionLevel::Best || dopts.iterations > 1) {
+            WriteOptions pwopts;
+            pwopts.filters = cand.filters;
+            pwopts.deflate.level = CompressionLevel::Best;
+            pwopts.deflate.iterations = 1;
+            pwopts.deflate.adaptive_blocks = !is_huge;
+            pwopts.deflate.max_block_size = 65536;
+            pwopts.deflate.row_stride = static_cast<int>(work.raw_scanline_size() + 1);
+            // Only build proxy PNG if proxy zlib + chunk overhead could beat png_out
+            if (tr.proxy_total_size + 57 < png_out.size()) {
+                auto proxy_png = writer.write(work, pwopts);
+                if (proxy_png.size() < png_out.size()) {
+                    png_out = std::move(proxy_png);
                 }
             }
         }
+
+        finals[ri] = FinalCandidate{std::move(png_out), strat.name + "-actual"};
+    });
+    if (opts.verbose) {
+        for (size_t ri = 0; ri < finals.size(); ++ri)
+            std::cout << "  Actual " << finals[ri].name << ": "
+                      << finals[ri].png_data.size() << " bytes PNG\n";
     }
 
-    size_t best_idx = 0;
-    for (size_t ri = 1; ri < finals.size(); ++ri) {
-        if (finals[ri].png_data.size() < finals[best_idx].png_data.size()) {
-            best_idx = ri;
+    std::vector<size_t> order(finals.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return finals[a].png_data.size() < finals[b].png_data.size();
+    });
+
+    // Never trust an encoder output without decoding it: pick the smallest
+    // candidate that round-trips to exactly the input pixels.
+    for (size_t idx : order) {
+        std::string why;
+        if (verify_png(finals[idx].png_data, img_in, &why)) {
+            CompressResult best_result;
+            best_result.data = std::move(finals[idx].png_data);
+            best_result.strategy_name = finals[idx].name;
+            best_result.time_seconds = total.elapsed_seconds();
+            best_result.original_size = img.pixels.size();
+            return best_result;
         }
+        std::cerr << "warning: candidate " << finals[idx].name
+                  << " failed verification (" << why << "), discarded\n";
     }
+    throw std::runtime_error("no compressed candidate passed verification");
+}
 
-    CompressResult best_result;
-    best_result.data = std::move(finals[best_idx].png_data);
-    best_result.strategy_name = finals[best_idx].name;
-    best_result.time_seconds = total.elapsed_seconds();
-    best_result.original_size = img.pixels.size();
-    return best_result;
+bool verify_png(const std::vector<uint8_t>& png, const Image& reference, std::string* why) {
+    if (png.empty()) {
+        if (why) *why = "empty output";
+        return false;
+    }
+    PNGReader reader;
+    auto decoded = reader.read(png);
+    if (!decoded) {
+        if (why) *why = "re-decode failed: " + reader.error();
+        return false;
+    }
+    if (!reader.warnings().empty()) {
+        if (why) *why = "re-decode warning: " + reader.warnings().front();
+        return false;
+    }
+    return images_equivalent(reference, *decoded, why);
+}
+
+CompressResult compress_safe(const Image& img, const CompressOptions& opts) {
+    // Most conservative encoding: original colour format, simple filters,
+    // standard DEFLATE. Used when every optimized candidate failed.
+    Image work = img;
+    apply_strip_ancillary(work, opts.strip_ancillary, opts.keep_color_info);
+    FilterOptions fopts;
+    fopts.level = 0;
+    WriteOptions wopts;
+    wopts.filters = optimize_filters(work, fopts);
+    wopts.deflate.level = CompressionLevel::Default;
+    wopts.deflate.iterations = 1;
+    wopts.deflate.row_stride = static_cast<int>(work.raw_scanline_size() + 1);
+    PNGWriter writer;
+    CompressResult r;
+    r.data = writer.write(work, wopts);
+    r.strategy_name = "safe-fallback";
+    r.original_size = img.pixels.size();
+    return r;
+}
+
+CompressResult compress(const Image& img, const CompressOptions& opts) {
+    std::string first_error;
+    try {
+        if (!opts.multi_strategy || opts.level <= 0) {
+            auto r = compress_single(img, opts);
+            std::string why;
+            if (verify_png(r.data, img, &why)) return r;
+            first_error = "single-strategy output failed verification (" + why + ")";
+        } else {
+            return compress_multi(img, opts);
+        }
+    } catch (const std::bad_alloc&) {
+        first_error = "out of memory";
+    } catch (const std::exception& e) {
+        first_error = e.what();
+    }
+    if (opts.verbose || !first_error.empty())
+        std::cerr << "warning: " << first_error << "; using safe fallback encoding\n";
+    auto r = compress_safe(img, opts);
+    std::string why;
+    if (!verify_png(r.data, img, &why))
+        throw std::runtime_error("safe fallback encoding failed verification: " + why);
+    return r;
 }
 
 } // namespace fpng

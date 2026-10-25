@@ -10,6 +10,8 @@
 
 #include <cstring>
 #include <climits>
+#include <algorithm>
+#include <stdexcept>
 
 namespace fpng {
 
@@ -84,84 +86,206 @@ void PNGWriter::write_trns(std::vector<uint8_t>& out, const Image& img) {
     }
 }
 
+namespace {
+
+size_t channels_of(uint8_t ct) {
+    switch (ct) { case 0: return 1; case 2: return 3; case 3: return 3; case 4: return 2; default: return 4; }
+}
+
+// Make colour-dependent ancillary chunks consistent with the (possibly
+// reduced) colour type / bit depth / palette, converting where possible and
+// dropping them where not. Writing them unchanged produced invalid files
+// (e.g. a 4-byte sBIT on an RGB image after alpha stripping).
+void sanitize_for_format(Image& img) {
+    auto& a = img.ancillary;
+    const uint8_t ct = img.color_type;
+    const unsigned sample_depth = (ct == 3) ? 8u : img.bit_depth;
+
+    if (ct == 0 || ct == 4) img.palette.clear();  // PLTE forbidden for grayscale
+    if (ct == 3) {
+        size_t n = img.palette.size() / 3;
+        if (img.alpha_palette.size() > n) img.alpha_palette.resize(n);
+    } else {
+        img.alpha_palette.clear();
+    }
+
+    // tRNS for grayscale / truecolour: exact length and in-range value.
+    if (!a.tRNS.empty()) {
+        size_t want = (ct == 0) ? 2 : (ct == 2) ? 6 : 0;
+        bool ok = want != 0 && a.tRNS.size() == want;
+        if (ok && img.bit_depth < 16) {
+            unsigned maxv = (1u << img.bit_depth) - 1;
+            for (size_t i = 0; i < want; i += 2)
+                if (static_cast<unsigned>((a.tRNS[i] << 8) | a.tRNS[i + 1]) > maxv) ok = false;
+        }
+        if (!ok) a.tRNS.clear();
+    }
+
+    // sBIT: rebuild for the current channel layout from whatever layout the
+    // stored values describe (1=G, 2=GA, 3=RGB, 4=RGBA).
+    if (a.sBIT) {
+        const auto& old = *a.sBIT;
+        bool ok = old.size() >= 1 && old.size() <= 4;
+        unsigned color_sig = 0, alpha_sig = 0;
+        if (ok) {
+            size_t nc = (old.size() >= 3) ? 3 : 1;
+            for (size_t i = 0; i < nc; ++i) color_sig = std::max<unsigned>(color_sig, old[i]);
+            if (old.size() == 2) alpha_sig = old[1];
+            if (old.size() == 4) alpha_sig = old[3];
+        }
+        size_t want = channels_of(ct);
+        bool has_alpha = (ct == 4 || ct == 6);
+        if (ok && color_sig > 0 && (!has_alpha || alpha_sig > 0)) {
+            std::vector<uint8_t> nb;
+            size_t ncolor = (ct == 0 || ct == 4) ? 1 : 3;
+            for (size_t i = 0; i < ncolor; ++i) {
+                unsigned v = (old.size() >= 3 && ncolor == 3) ? old[i] : color_sig;
+                nb.push_back(static_cast<uint8_t>(std::clamp(v, 1u, sample_depth)));
+            }
+            if (has_alpha) nb.push_back(static_cast<uint8_t>(std::clamp(alpha_sig, 1u, sample_depth)));
+            if (nb.size() == want) a.sBIT = std::move(nb); else a.sBIT.reset();
+        } else {
+            a.sBIT.reset();
+        }
+    }
+
+    // bKGD: must match the colour type; values must be representable.
+    if (a.bKGD) {
+        const auto& b = *a.bKGD;
+        bool ok;
+        if (ct == 3) {
+            ok = b.size() == 1 && b[0] < img.palette.size() / 3;
+        } else {
+            size_t want = (ct == 0 || ct == 4) ? 2 : 6;
+            ok = b.size() == want;
+            if (ok && img.bit_depth < 16) {
+                unsigned maxv = (1u << img.bit_depth) - 1;
+                for (size_t i = 0; i < want; i += 2)
+                    if (static_cast<unsigned>((b[i] << 8) | b[i + 1]) > maxv) ok = false;
+            }
+        }
+        if (!ok) a.bKGD.reset();
+    }
+}
+
+} // namespace
+
 void PNGWriter::write_ancillary(std::vector<uint8_t>& out, const Image& img) {
+    // Chunks that must precede PLTE.
     const auto& a = img.ancillary;
     auto write_if = [&](const char* tag, const std::optional<std::vector<uint8_t>>& data) {
         if (data) write_chunk(out, tag, *data);
     };
+    write_if("cICP", a.cICP);
     write_if("gAMA", a.gAMA);
     write_if("cHRM", a.cHRM);
-    write_if("sRGB", a.sRGB);
-    write_if("iCCP", a.iCCP);
+    // iCCP and sRGB are mutually exclusive per spec; prefer the explicit profile.
+    if (a.iCCP) write_if("iCCP", a.iCCP);
+    else write_if("sRGB", a.sRGB);
     write_if("sBIT", a.sBIT);
-    write_if("bKGD", a.bKGD);
-    write_if("pHYs", a.pHYs);
-    write_if("tIME", a.tIME);
-    write_if("cICP", a.cICP);
-    for (const auto& [tag, data] : a.text_chunks) {
+    write_other(out, img, 0);
+}
+
+void PNGWriter::write_post_plte(std::vector<uint8_t>& out, const Image& img) {
+    // Chunks that must follow PLTE (bKGD, tRNS) or merely precede IDAT.
+    const auto& a = img.ancillary;
+    write_trns(out, img);
+    if (a.bKGD) write_chunk(out, "bKGD", *a.bKGD);
+    if (a.pHYs) write_chunk(out, "pHYs", *a.pHYs);
+    if (a.tIME) write_chunk(out, "tIME", *a.tIME);
+    for (const auto& [tag, data] : a.text_chunks)
         write_chunk(out, tag.c_str(), data);
-    }
+    write_other(out, img, 1);
+}
+
+void PNGWriter::write_trailing(std::vector<uint8_t>& out, const Image& img) {
+    write_other(out, img, 2);
+}
+
+void PNGWriter::write_other(std::vector<uint8_t>& out, const Image& img, uint8_t where) {
+    for (const auto& c : img.ancillary.other_chunks)
+        if (c.where == where && c.type.size() == 4)
+            write_chunk(out, c.type.c_str(), c.data);
+}
+
+static void put_fctl(uint8_t* fctl, const FrameInfo& f, uint32_t seq) {
+    write_big32(fctl, seq);
+    write_big32(fctl + 4, f.width);
+    write_big32(fctl + 8, f.height);
+    write_big32(fctl + 12, f.x_offset);
+    write_big32(fctl + 16, f.y_offset);
+    write_big16(fctl + 20, f.delay_num);
+    write_big16(fctl + 22, f.delay_den);
+    fctl[24] = f.dispose_op;
+    fctl[25] = f.blend_op;
 }
 
 void PNGWriter::write_apng_chunks(std::vector<uint8_t>& out, const Image& img) {
     if (!img.is_animated || img.frames.empty()) return;
 
-    // acTL
     uint8_t actl[8];
     write_big32(actl, static_cast<uint32_t>(img.frames.size()));
     write_big32(actl + 4, img.num_plays);
     write_chunk(out, "acTL", {actl, 8});
+}
 
-    // fcTL for frame 0 (the static image / IDAT)
-    if (!img.frames.empty()) {
-        const auto& f = img.frames[0];
-        uint8_t fctl[26];
-        write_big32(fctl, f.sequence_number);
-        write_big32(fctl + 4, f.width);
-        write_big32(fctl + 8, f.height);
-        write_big32(fctl + 12, f.x_offset);
-        write_big32(fctl + 16, f.y_offset);
-        write_big16(fctl + 20, f.delay_num);
-        write_big16(fctl + 22, f.delay_den);
-        fctl[24] = f.dispose_op;
-        fctl[25] = f.blend_op;
-        write_chunk(out, "fcTL", {fctl, 26});
-    }
+void PNGWriter::write_data_chunks(std::vector<uint8_t>& out, const char type[4],
+                                  const std::vector<uint8_t>& prefix,
+                                  const std::vector<uint8_t>& payload) {
+    // Chunk lengths are limited to 2^31-1; split very large streams.
+    const size_t kMax = size_t(1) << 30;
+    size_t pos = 0;
+    do {
+        size_t n = std::min(kMax, payload.size() - pos);
+        if (prefix.empty()) {
+            write_chunk(out, type, {payload.data() + pos, n});
+        } else {
+            std::vector<uint8_t> buf(prefix);
+            buf.insert(buf.end(), payload.begin() + pos, payload.begin() + pos + n);
+            write_chunk(out, type, buf);
+        }
+        pos += n;
+    } while (pos < payload.size());
 }
 
 void PNGWriter::write_idat(std::vector<uint8_t>& out, const Image& img,
                              const WriteOptions& wopts) {
+    // Sequence numbers are rewritten densely from 0 (fcTL and fdAT share them).
+    uint32_t seq = 0;
+    bool animated = img.is_animated && !img.frames.empty();
+
+    if (animated && img.frames[0].from_idat) {
+        uint8_t fctl[26];
+        put_fctl(fctl, img.frames[0], seq++);
+        write_chunk(out, "fcTL", {fctl, 26});
+    }
+
     auto compressed = filter_and_compress(img, wopts);
-    write_chunk(out, "IDAT", compressed);
+    if (compressed.empty()) throw std::runtime_error("PNG writer: image compression produced no data");
+    write_data_chunks(out, "IDAT", {}, compressed);
 
-    // Write additional frames as fdAT chunks
-    if (img.is_animated && img.frames.size() > 1) {
-        for (size_t i = 1; i < img.frames.size(); ++i) {
-            const auto& f = img.frames[i];
+    if (!animated) return;
+    for (size_t i = 0; i < img.frames.size(); ++i) {
+        const auto& f = img.frames[i];
+        if (f.from_idat) continue;
 
-            // fcTL
-            uint8_t fctl[26];
-            write_big32(fctl, f.sequence_number);
-            write_big32(fctl + 4, f.width);
-            write_big32(fctl + 8, f.height);
-            write_big32(fctl + 12, f.x_offset);
-            write_big32(fctl + 16, f.y_offset);
-            write_big16(fctl + 20, f.delay_num);
-            write_big16(fctl + 22, f.delay_den);
-            fctl[24] = f.dispose_op;
-            fctl[25] = f.blend_op;
-            write_chunk(out, "fcTL", {fctl, 26});
+        uint8_t fctl[26];
+        put_fctl(fctl, f, seq++);
+        write_chunk(out, "fcTL", {fctl, 26});
 
-            // fdAT
-            auto frame_compressed = filter_and_compress_frame(img, f, wopts);
-            std::vector<uint8_t> fdat;
-            fdat.reserve(4 + frame_compressed.size());
-            uint8_t seq_buf[4];
-            write_big32(seq_buf, f.sequence_number);
-            fdat.insert(fdat.end(), seq_buf, seq_buf + 4);
-            fdat.insert(fdat.end(), frame_compressed.begin(), frame_compressed.end());
+        auto frame_compressed = filter_and_compress_frame(img, f, wopts);
+        if (frame_compressed.empty()) throw std::runtime_error("PNG writer: frame compression produced no data");
+        // fdAT payload = sequence number + zlib data; each split chunk gets its own number.
+        const size_t kMax = size_t(1) << 30;
+        size_t pos = 0;
+        do {
+            size_t n = std::min(kMax, frame_compressed.size() - pos);
+            std::vector<uint8_t> fdat(4);
+            write_big32(fdat.data(), seq++);
+            fdat.insert(fdat.end(), frame_compressed.begin() + pos, frame_compressed.begin() + pos + n);
             write_chunk(out, "fdAT", fdat);
-        }
+            pos += n;
+        } while (pos < frame_compressed.size());
     }
 }
 
@@ -305,16 +429,31 @@ std::vector<uint8_t> PNGWriter::filter_and_compress_frame(const Image& img,
     return zlib_compress(filtered, deflate);
 }
 
-std::vector<uint8_t> PNGWriter::write(const Image& img,
+std::vector<uint8_t> PNGWriter::write(const Image& img_in,
                                        const WriteOptions& wopts) {
+    // Work on a header-only copy for chunk sanitising; pixel buffers are
+    // shared by reference through `img_in` for compression.
+    Image hdr;
+    hdr.width = img_in.width;
+    hdr.height = img_in.height;
+    hdr.bit_depth = img_in.bit_depth;
+    hdr.color_type = img_in.color_type;
+    hdr.palette = img_in.palette;
+    hdr.alpha_palette = img_in.alpha_palette;
+    hdr.ancillary = img_in.ancillary;
+    hdr.is_animated = img_in.is_animated;
+    hdr.num_plays = img_in.num_plays;
+    sanitize_for_format(hdr);
+
     std::vector<uint8_t> out;
     write_signature(out);
-    write_ihdr(out, img, wopts);
-    write_ancillary(out, img);
-    write_plte(out, img);
-    write_trns(out, img);
-    write_apng_chunks(out, img);
-    write_idat(out, img, wopts);
+    write_ihdr(out, hdr, wopts);
+    write_ancillary(out, hdr);
+    write_apng_chunks(out, img_in);
+    write_plte(out, hdr);
+    write_post_plte(out, hdr);
+    write_idat(out, img_in, wopts);
+    write_trailing(out, hdr);
     write_iend(out);
     return out;
 }

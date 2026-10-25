@@ -92,6 +92,14 @@ struct HuffmanTree {
             return;
         }
 
+        // Reject over-subscribed code sets (they are not prefix codes).
+        int left = 1;
+        for (int bits = 1; bits <= MAX_BITS; ++bits) {
+            left <<= 1;
+            left -= bl_count[bits];
+            if (left < 0) throw std::runtime_error("inflate: over-subscribed huffman code");
+        }
+
         uint16_t next_code[MAX_BITS + 1] = {};
         uint16_t code = 0;
         for (int bits = 1; bits <= MAX_BITS; ++bits) {
@@ -166,13 +174,17 @@ struct HuffmanTree {
     }
 };
 
-static void decompress_block(BitReader& br, std::vector<uint8_t>& output, bool& done) {
+static void decompress_block(BitReader& br, std::vector<uint8_t>& output, bool& done,
+                             size_t max_out) {
     int bfinal = br.read_bits(1);
     int btype  = br.read_bits(2);
 
     if (btype == 0) {
         // Stored block
         br.align_to_byte();
+        // Give back whole bytes that were read ahead into the bit buffer.
+        br.byte_pos -= static_cast<size_t>(br.bits_in_buf / 8);
+        br.bits_in_buf = 0; br.bit_buf = 0;
         if (br.byte_pos + 4 > br.size) throw std::runtime_error("inflate: eof in stored header");
         uint16_t len  = static_cast<uint16_t>(br.data[br.byte_pos]) |
                         (static_cast<uint16_t>(br.data[br.byte_pos + 1]) << 8);
@@ -182,6 +194,8 @@ static void decompress_block(BitReader& br, std::vector<uint8_t>& output, bool& 
         br.byte_pos += 4;
         br.bits_in_buf = 0; br.bit_buf = 0;
         if (br.byte_pos + len > br.size) throw std::runtime_error("inflate: stored overflow");
+        if (output.size() + len > max_out)
+            throw std::runtime_error("inflate: output exceeds expected size");
         output.insert(output.end(), br.data + br.byte_pos, br.data + br.byte_pos + len);
         br.byte_pos += len;
         done = bfinal;
@@ -204,16 +218,22 @@ static void decompress_block(BitReader& br, std::vector<uint8_t>& output, bool& 
         for (;;) {
             int sym = litlen_tree.decode(br);
             if (sym < 256) {
+                if (output.size() >= max_out)
+                    throw std::runtime_error("inflate: output exceeds expected size");
                 output.push_back(static_cast<uint8_t>(sym));
             } else if (sym == 256) {
                 break;
             } else {
                 int code = sym - 257;
-                int length = LEN_BASE[code] + br.read_bits(LEN_EXTRA_BITS[code]);
+                if (code > 28) throw std::runtime_error("inflate: invalid length symbol");
+                int length = LEN_BASE[code] + static_cast<int>(br.read_bits(LEN_EXTRA_BITS[code]));
                 int dcode = dist_tree.decode(br);
-                int distance = DIST_BASE[dcode] + br.read_bits(DIST_EXTRA_BITS[dcode]);
-                if (distance > static_cast<int>(output.size()))
+                if (dcode < 0 || dcode > 29) throw std::runtime_error("inflate: invalid distance symbol");
+                int distance = DIST_BASE[dcode] + static_cast<int>(br.read_bits(DIST_EXTRA_BITS[dcode]));
+                if (distance > static_cast<int>(std::min<size_t>(output.size(), 32768)))
                     throw std::runtime_error("inflate: invalid distance");
+                if (output.size() + static_cast<size_t>(length) > max_out)
+                    throw std::runtime_error("inflate: output exceeds expected size");
                 size_t src = output.size() - distance;
                 for (int i = 0; i < length; ++i)
                     output.push_back(output[src + i]);
@@ -236,7 +256,9 @@ static void decompress_block(BitReader& br, std::vector<uint8_t>& output, bool& 
         HuffmanTree clen_tree;
         clen_tree.build(clen_len, 19);
 
-        int litlen_len[286] = {};
+        if (hlit > 286 || hdist > 30)
+            throw std::runtime_error("inflate: invalid HLIT/HDIST");
+        int litlen_len[288] = {};
         int dist_len[32] = {};
         int total = hlit + hdist;
         int idx = 0;
@@ -249,27 +271,32 @@ static void decompress_block(BitReader& br, std::vector<uint8_t>& output, bool& 
                 ++idx;
             } else if (sym == 16) {
                 if (idx == 0) throw std::runtime_error("inflate: repeat with no previous");
-                int prev = idx <= hlit ? litlen_len[idx - 1] : dist_len[idx - hlit - 1];
+                int prev = (idx - 1 < hlit) ? litlen_len[idx - 1] : dist_len[idx - 1 - hlit];
                 int repeat = br.read_bits(2) + 3;
-                for (int i = 0; i < repeat && idx < total; ++i, ++idx) {
+                if (idx + repeat > total) throw std::runtime_error("inflate: code length repeat overflows");
+                for (int i = 0; i < repeat; ++i, ++idx) {
                     if (idx < hlit) litlen_len[idx] = prev;
                     else dist_len[idx - hlit] = prev;
                 }
             } else if (sym == 17) {
                 int repeat = br.read_bits(3) + 3;
-                for (int i = 0; i < repeat && idx < total; ++i, ++idx) {
+                if (idx + repeat > total) throw std::runtime_error("inflate: code length repeat overflows");
+                for (int i = 0; i < repeat; ++i, ++idx) {
                     if (idx < hlit) litlen_len[idx] = 0;
                     else dist_len[idx - hlit] = 0;
                 }
             } else if (sym == 18) {
                 int repeat = br.read_bits(7) + 11;
-                for (int i = 0; i < repeat && idx < total; ++i, ++idx) {
+                if (idx + repeat > total) throw std::runtime_error("inflate: code length repeat overflows");
+                for (int i = 0; i < repeat; ++i, ++idx) {
                     if (idx < hlit) litlen_len[idx] = 0;
                     else dist_len[idx - hlit] = 0;
                 }
             }
         }
 
+        if (litlen_len[256] == 0)
+            throw std::runtime_error("inflate: missing end-of-block code");
         HuffmanTree litlen_tree, dist_tree;
         litlen_tree.build(litlen_len, hlit);
         dist_tree.build(dist_len, hdist);
@@ -277,16 +304,22 @@ static void decompress_block(BitReader& br, std::vector<uint8_t>& output, bool& 
         for (;;) {
             int sym = litlen_tree.decode(br);
             if (sym < 256) {
+                if (output.size() >= max_out)
+                    throw std::runtime_error("inflate: output exceeds expected size");
                 output.push_back(static_cast<uint8_t>(sym));
             } else if (sym == 256) {
                 break;
             } else {
                 int code = sym - 257;
-                int length = LEN_BASE[code] + br.read_bits(LEN_EXTRA_BITS[code]);
+                if (code > 28) throw std::runtime_error("inflate: invalid length symbol");
+                int length = LEN_BASE[code] + static_cast<int>(br.read_bits(LEN_EXTRA_BITS[code]));
                 int dcode = dist_tree.decode(br);
-                int distance = DIST_BASE[dcode] + br.read_bits(DIST_EXTRA_BITS[dcode]);
-                if (distance > static_cast<int>(output.size()))
+                if (dcode < 0 || dcode > 29) throw std::runtime_error("inflate: invalid distance symbol");
+                int distance = DIST_BASE[dcode] + static_cast<int>(br.read_bits(DIST_EXTRA_BITS[dcode]));
+                if (distance > static_cast<int>(std::min<size_t>(output.size(), 32768)))
                     throw std::runtime_error("inflate: invalid distance");
+                if (output.size() + static_cast<size_t>(length) > max_out)
+                    throw std::runtime_error("inflate: output exceeds expected size");
                 size_t src = output.size() - distance;
                 for (int i = 0; i < length; ++i)
                     output.push_back(output[src + i]);
@@ -301,20 +334,40 @@ static void decompress_block(BitReader& br, std::vector<uint8_t>& output, bool& 
 
 } // anonymous namespace
 
-std::vector<uint8_t> inflate_raw(std::span<const uint8_t> data) {
+static std::vector<uint8_t> inflate_impl(std::span<const uint8_t> data, size_t max_out,
+                                         size_t* consumed) {
     BitReader br(data.data(), data.size());
     std::vector<uint8_t> output;
-    output.reserve(data.size() * 4);
+    output.reserve(std::min(max_out, data.size() * 4 + 1024));
 
     bool done = false;
     while (!done) {
-        decompress_block(br, output, done);
+        decompress_block(br, output, done, max_out);
+    }
+    if (consumed) {
+        br.align_to_byte();
+        *consumed = br.byte_pos - static_cast<size_t>(br.bits_in_buf / 8);
     }
     return output;
 }
 
-std::vector<uint8_t> inflate_zlib(std::span<const uint8_t> data) {
-    if (data.size() < 6) throw std::runtime_error("inflate_zlib: too small");
+std::vector<uint8_t> inflate_raw(std::span<const uint8_t> data, size_t max_output) {
+    return inflate_impl(data, max_output, nullptr);
+}
+
+static uint32_t adler32(const uint8_t* p, size_t n) {
+    uint32_t a = 1, b = 0;
+    while (n > 0) {
+        size_t k = std::min<size_t>(n, 5552);
+        n -= k;
+        while (k--) { a += *p++; b += a; }
+        a %= 65521u; b %= 65521u;
+    }
+    return (b << 16) | a;
+}
+
+std::vector<uint8_t> inflate_zlib(std::span<const uint8_t> data, size_t max_output) {
+    if (data.size() < 2) throw std::runtime_error("inflate_zlib: too small");
 
     uint8_t cmf = data[0];
     uint8_t flg = data[1];
@@ -326,7 +379,20 @@ std::vector<uint8_t> inflate_zlib(std::span<const uint8_t> data) {
         throw std::runtime_error("inflate_zlib: header checksum mismatch");
     if (flg & 0x20) throw std::runtime_error("inflate_zlib: dict not supported");
 
-    return inflate_raw(data.subspan(2, data.size() - 6));
+    // Decode from the whole remainder: the deflate stream is self-terminating,
+    // so trailing padding after the Adler-32 (seen in real files) is harmless.
+    size_t used = 0;
+    auto out = inflate_impl(data.subspan(2), max_output, &used);
+    size_t apos = 2 + used;
+    if (apos + 4 <= data.size()) {
+        uint32_t want = (uint32_t(data[apos]) << 24) | (uint32_t(data[apos + 1]) << 16) |
+                        (uint32_t(data[apos + 2]) << 8) | uint32_t(data[apos + 3]);
+        if (want != adler32(out.data(), out.size()))
+            throw std::runtime_error("inflate_zlib: Adler-32 checksum mismatch");
+    }
+    // A missing checksum (truncated after the final block) is tolerated, like
+    // most decoders; the image data itself is complete in that case.
+    return out;
 }
 
 } // namespace fpng

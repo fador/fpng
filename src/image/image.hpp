@@ -21,6 +21,7 @@ struct FrameInfo {
     uint16_t delay_den = 0;
     uint8_t dispose_op = 0; // 0=none, 1=background, 2=previous
     uint8_t blend_op = 0;   // 0=source, 1=over
+    bool from_idat = false; // frame 0 whose pixels are the IDAT (default) image
 
     std::vector<uint8_t> image_data;
 };
@@ -53,6 +54,15 @@ struct Image {
         std::optional<std::vector<uint8_t>> tIME;
         std::optional<std::vector<uint8_t>> cICP;
         std::vector<std::pair<std::string, std::vector<uint8_t>>> text_chunks;
+        // Other ancillary chunks copied verbatim (eXIf and unknown chunks that
+        // are marked safe-to-copy). `where`: 0 = before PLTE, 1 = after PLTE
+        // and before IDAT, 2 = after IDAT.
+        struct RawChunk {
+            std::string type;
+            std::vector<uint8_t> data;
+            uint8_t where = 1;
+        };
+        std::vector<RawChunk> other_chunks;
         std::vector<uint8_t> tRNS; // for non-indexed
     } ancillary;
 

@@ -28,8 +28,22 @@ struct CompressResult {
 // Single-strategy compression (used internally and as fallback)
 CompressResult compress_single(const Image& img, const CompressOptions& opts);
 
-// Multi-strategy compression: tries multiple filter+deflate combos
+// Multi-strategy compression: tries multiple filter+deflate combos (no
+// verification; prefer compress()).
+CompressResult compress_multi(const Image& img, const CompressOptions& opts);
+
+// Main entry point. Runs the configured strategy set, decodes every result
+// and returns the smallest output that reproduces the input pixels exactly.
+// Falls back to a conservative encoding if optimization throws or no
+// candidate verifies. Throws only if even the fallback cannot be verified.
 CompressResult compress(const Image& img, const CompressOptions& opts = {});
+
+// Conservative encoder used as the last resort.
+CompressResult compress_safe(const Image& img, const CompressOptions& opts);
+
+// Decode `png` and check it is pixel-equivalent to `reference`.
+bool verify_png(const std::vector<uint8_t>& png, const Image& reference,
+                std::string* why = nullptr);
 
 // Strategy descriptor for one compression attempt
 struct Strategy {

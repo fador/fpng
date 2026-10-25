@@ -10,6 +10,7 @@ extern void test_roundtrip();
 extern void test_full_compress_pipeline();
 extern void test_deflate();
 extern void test_deflate_repro();
+extern void test_robustness();
 
 int main() {
     std::cout << "fpng Test Suite\n";
@@ -30,6 +31,8 @@ int main() {
     test_roundtrip();
     std::cout << "\n";
     test_full_compress_pipeline();
+    std::cout << "\n";
+    test_robustness();
 
     return summary();
 }

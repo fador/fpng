@@ -28,6 +28,22 @@ public:
                   int min_len = deflate::MIN_MATCH_LEN) const;
     size_t data_size() const noexcept { return size_; }
 
+    // Optional memo of find_all() for every position. Match candidates depend
+    // only on the data and the search parameters (chain_depth, row_stride),
+    // never on the cost model, so the iterative optimal parser (several
+    // global passes plus per-block refinement passes) can enumerate them once.
+    // Stored compactly as runs of lengths sharing one distance. Returns false
+    // (and stays uncached) if the memo would exceed max_entries.
+    bool build_match_cache(size_t max_entries);
+    bool has_match_cache() const noexcept { return !cache_off_.empty(); }
+    void find_all_cached(size_t pos, std::vector<LZMatch>& matches) const;
+    // Raw memo entries for pos: each is (last_length << 16) | distance,
+    // covering lengths from the previous entry's last_length+1 (or 3).
+    void cached_segments(size_t pos, const uint32_t*& b, const uint32_t*& e) const {
+        b = cache_seg_.data() + cache_off_[pos];
+        e = cache_seg_.data() + cache_off_[pos + 1];
+    }
+
     size_t chain_depth = 128; // max matches to examine per position
     int nice_len = 32;
     int row_stride = 0;
@@ -54,6 +70,11 @@ private:
     // sized to the input and verified against collisions on lookup.
     std::vector<int32_t> prev3_;
     std::vector<int32_t> hash3_table_;
+
+    // find_all memo: entries [cache_off_[p], cache_off_[p+1]) hold
+    // (last_length << 16) | distance for consecutive length runs (L >= 3).
+    std::vector<uint32_t> cache_off_;
+    std::vector<uint32_t> cache_seg_;
 };
 
 // LZ77 parser with multiple strategies
@@ -134,7 +155,7 @@ private:
         std::vector<uint64_t> cost;
         std::vector<int> prev_match_len;
         std::vector<int> prev_match_dist;
-        std::vector<bool> is_literal;
+        std::vector<uint8_t> is_literal;
         std::vector<LZMatch> matches;
     };
     Workspace ws_;

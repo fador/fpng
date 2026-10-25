@@ -124,10 +124,16 @@ void encode_dynamic_tokens(BitWriter& bw,
 
         // DP over zero-runs: cover k zeros with individual 0s (cost[0] each),
         // code-17 (3-10 zeros, cost[17]+3), or code-18 (11-138 zeros, cost[18]+7).
+        // run <= HLIT + HDIST <= 316, so fixed-size scratch avoids three heap
+        // allocations per run per round.
+        constexpr int MAXRUN = deflate::MAX_LITLEN_SYMS + deflate::MAX_DIST_SYMS;
+        int dp[MAXRUN + 1];
+        uint8_t choice[MAXRUN + 1];
+        uint8_t span[MAXRUN + 1];
+        struct Seg { uint8_t code; uint8_t count; };
+        Seg segs[MAXRUN + 1];
         auto dp_zeros = [&](int run, std::vector<uint8_t>& emit) {
-            std::vector<int> dp(run + 1, INT_MAX);
-            std::vector<uint8_t> choice(run + 1, 0); // 1 = single, 2 = code17, 3 = code18
-            std::vector<uint8_t> span(run + 1, 0);
+            for (int j = 0; j <= run; ++j) { dp[j] = INT_MAX; choice[j] = 0; span[j] = 0; } // 1 = single, 2 = code17, 3 = code18
             dp[0] = 0;
             for (int j = 1; j <= run; ++j) {
                 if (dp[j - 1] != INT_MAX && dp[j - 1] + cost[0] < dp[j]) {
@@ -145,14 +151,13 @@ void encode_dynamic_tokens(BitWriter& bw,
                 }
             }
             // Backtrack into temporary buffer, then reverse-emit.
-            struct Seg { uint8_t code; uint8_t count; };
-            std::vector<Seg> segs;
+            int nseg = 0;
             int pos = run;
             while (pos > 0) {
-                segs.push_back({choice[pos], span[pos]});
+                segs[nseg++] = {choice[pos], span[pos]};
                 pos -= span[pos];
             }
-            for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+            for (const Seg* it = segs + nseg; it-- != segs;) {
                 if (it->code == 1) { emit.push_back(0); }
                 else if (it->code == 2) {
                     emit.push_back(17);
@@ -171,9 +176,7 @@ void encode_dynamic_tokens(BitWriter& bw,
             emit.push_back(len);
             int rem = run - 1;
             if (rem <= 0) return;
-            std::vector<int> dp(rem + 1, INT_MAX);
-            std::vector<uint8_t> choice(rem + 1, 0); // 1 = single, 2 = code16
-            std::vector<uint8_t> span(rem + 1, 0);
+            for (int j = 0; j <= rem; ++j) { dp[j] = INT_MAX; choice[j] = 0; span[j] = 0; } // 1 = single, 2 = code16
             dp[0] = 0;
             for (int j = 1; j <= rem; ++j) {
                 if (dp[j - 1] != INT_MAX && dp[j - 1] + cost[len] < dp[j]) {
@@ -185,14 +188,13 @@ void encode_dynamic_tokens(BitWriter& bw,
                     if (c < dp[j]) { dp[j] = c; choice[j] = 2; span[j] = static_cast<uint8_t>(k); }
                 }
             }
-            struct Seg { uint8_t code; uint8_t count; };
-            std::vector<Seg> segs;
+            int nseg = 0;
             int pos = rem;
             while (pos > 0) {
-                segs.push_back({choice[pos], span[pos]});
+                segs[nseg++] = {choice[pos], span[pos]};
                 pos -= span[pos];
             }
-            for (auto it = segs.rbegin(); it != segs.rend(); ++it) {
+            for (const Seg* it = segs + nseg; it-- != segs;) {
                 if (it->code == 1) emit.push_back(len);
                 else {
                     emit.push_back(16);
@@ -265,7 +267,15 @@ void encode_dynamic_tokens(BitWriter& bw,
         }
         // Re-cost for next round using the freshly built tree; give unused
         // symbols a realistic introduction penalty (6 bits) rather than 1 bit.
-        for (int c = 0; c < 19; ++c) cost[c] = cl[c] ? cl[c] : 6;
+        bool same_cost = true;
+        for (int c = 0; c < 19; ++c) {
+            int nc = cl[c] ? cl[c] : 6;
+            if (nc != cost[c]) same_cost = false;
+            cost[c] = nc;
+        }
+        // Fixpoint: every further round would rebuild the identical RLE
+        // stream and score (and only strictly better scores are kept).
+        if (same_cost) break;
     }
 
     tree_rle = std::move(best_rle);
@@ -554,7 +564,8 @@ void encode_block_optimal(BitWriter& bw,
     } else if (stored_bits <= dynamic_bits) {
         write_stored_block(bw, raw_data, block_size, is_last);
     } else {
-        encode_dynamic_tokens(bw, tokens, tb, te, is_last);
+        // Same tokens, same flags: reuse the trial encoding bit-for-bit.
+        bw.append(test_bw);
     }
 }
 
@@ -689,6 +700,11 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
             if (iter == 0) {
                 popts.optimal = false;
             } else {
+                // All optimal passes (global and per-block refinement) query
+                // the same positions with the same match finder: enumerate
+                // matches once. Capped so huge inputs fall back to on-the-fly.
+                if (iter == 1 && !shared_mf.has_match_cache())
+                    shared_mf.build_match_cache(size_t(96) << 20);
                 popts.optimal = true;
                 LZ77Parser::CostModel cm;
                 cm.precomputed_costs = actual_costs.data();
@@ -718,6 +734,11 @@ std::vector<uint8_t> Deflater::compress(std::span<const uint8_t> data,
 
             // Compute exact encoded bit length for single-block streams, or
             // payload + tree header estimate for multi-block streams.
+            if (iters == 1) {
+                // Nothing to choose between; the size estimate is unused.
+                best_tokens = std::move(tokens);
+                break;
+            }
             uint64_t total_bits = 0;
             if (data.size() <= eff_block_size && ! tokens.empty()) {
                 total_bits = compute_block_optimal_bits(0, tokens, 0, tokens.size() - 1,

@@ -162,10 +162,13 @@ std::vector<uint8_t> read_file(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return {};
 
-    auto size = static_cast<size_t>(f.tellg());
+    auto end = f.tellg();
+    if (end <= 0) return {};
+    auto size = static_cast<size_t>(end);
     std::vector<uint8_t> data(size);
     f.seekg(0, std::ios::beg);
     f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size));
+    if (static_cast<size_t>(f.gcount()) != size) return {};
     return data;
 }
 
@@ -174,7 +177,10 @@ bool write_file(const std::filesystem::path& path,
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f) return false;
     f.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(size));
-    return f.good();
+    f.flush();
+    bool ok = f.good();
+    f.close();
+    return ok && !f.fail();
 }
 
 } // namespace fpng

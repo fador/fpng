@@ -26,6 +26,7 @@ set(FPNG_SOURCES
     src/png/reader.cpp
     src/png/writer.cpp
     src/image/image.cpp
+    src/image/compare.cpp
     src/preprocess/alpha_optimizer.cpp
     src/preprocess/color_reducer.cpp
     src/preprocess/palette_sorter.cpp
@@ -89,6 +90,13 @@ endif()
 
 add_executable(fpng src/main.cpp)
 target_link_libraries(fpng PRIVATE fpng_core)
+if(WIN32)
+    target_link_libraries(fpng PRIVATE shell32)
+endif()
+
+# Threads (std::async) need -pthread with some GCC/glibc combinations.
+find_package(Threads REQUIRED)
+target_link_libraries(fpng_core PUBLIC Threads::Threads)
 
 if(FPNG_BUILD_TESTS)
     add_executable(fpng_test
@@ -97,6 +105,7 @@ if(FPNG_BUILD_TESTS)
         src/test/test_png.cpp
         src/test/test_deflate.cpp
         src/test/test_filter.cpp
+        src/test/test_robustness.cpp
     )
     target_link_libraries(fpng_test PRIVATE fpng_core)
 endif()

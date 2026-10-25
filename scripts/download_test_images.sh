@@ -26,6 +26,12 @@ echo "--- ImageCompression.info ---"
 if [ ! -f "bridge.png" ]; then
     for img in bridge lighthouse faces flowers; do
         wget -q "http://imagecompression.info/test_images/${img}.png" -O "${img}.png" || true
+        # The site now serves an HTML page for these URLs; never keep a
+        # non-PNG file in the corpus (it silently skews benchmarks).
+        if [ -f "${img}.png" ] && [ "$(head -c 8 "${img}.png" | od -An -tx1 | tr -d ' \n')" != "89504e470d0a1a0a" ]; then
+            echo "  ${img}.png is not a PNG (got HTML?) - removed"
+            rm -f "${img}.png"
+        fi
     done
     echo "Downloaded photographic test images"
 else

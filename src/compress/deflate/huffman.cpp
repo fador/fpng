@@ -178,21 +178,23 @@ void compute_huffman_lengths(const uint32_t* freqs, size_t n, int max_bits,
 
     int root = heap[0].second;
 
-    // DFS to assign lengths (uncapped so we can detect > max_bits)
-    std::function<void(int, int)> assign = [&](int node_idx, int depth) {
-        if (node_idx < 0) return;
-        auto& nd = nodes[node_idx];
+    // Assign depths (uncapped so we can detect > max_bits). Children are
+    // always created before their parent, so a single descending sweep from
+    // the root visits every parent before its children; this yields exactly
+    // the depths of the former recursive std::function DFS without the
+    // per-node indirect calls.
+    std::vector<uint8_t> depth(nodes.size(), 0);
+    for (int idx = root; idx >= 0; --idx) {
+        const auto& nd = nodes[idx];
         if (nd.left < 0 && nd.right < 0) {
-            if (nd.symbol >= 0 && nd.symbol < static_cast<int>(n)) {
-                lengths[nd.symbol] = static_cast<uint8_t>(depth);
-            }
-            return;
+            if (nd.symbol >= 0 && nd.symbol < static_cast<int>(n))
+                lengths[nd.symbol] = depth[idx];
+            continue;
         }
-        assign(nd.left, depth + 1);
-        assign(nd.right, depth + 1);
-    };
-
-    assign(root, 0);
+        uint8_t d = static_cast<uint8_t>(depth[idx] + 1);
+        if (nd.left >= 0) depth[nd.left] = d;
+        if (nd.right >= 0) depth[nd.right] = d;
+    }
 
     // Determine the maximum code length. If it already fits within max_bits,
     // the plain Huffman tree is optimal and no further work is needed.

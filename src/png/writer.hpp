@@ -40,6 +40,12 @@ private:
     void write_ancillary(std::vector<uint8_t>& out, const Image& img);
     void write_plte(std::vector<uint8_t>& out, const Image& img);
     void write_trns(std::vector<uint8_t>& out, const Image& img);
+    void write_post_plte(std::vector<uint8_t>& out, const Image& img);
+    void write_trailing(std::vector<uint8_t>& out, const Image& img);
+    void write_other(std::vector<uint8_t>& out, const Image& img, uint8_t where);
+    void write_data_chunks(std::vector<uint8_t>& out, const char type[4],
+                           const std::vector<uint8_t>& prefix,
+                           const std::vector<uint8_t>& payload);
     void write_apng_chunks(std::vector<uint8_t>& out, const Image& img);
     void write_idat(std::vector<uint8_t>& out, const Image& img,
                      const WriteOptions& wopts);

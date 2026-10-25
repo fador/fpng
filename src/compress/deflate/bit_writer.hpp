@@ -24,6 +24,9 @@ public:
 
     void align_to_byte();
 
+    // Append all bits written to `other` (which started at bit 0).
+    void append(const BitWriter& other);
+
 private:
     std::vector<uint8_t> buf_;
     int byte_pos_ = 0;
@@ -60,6 +63,13 @@ inline void BitWriter::flush_to_byte() {
         bit_buf_ = 0;
         bits_in_buf_ = 0;
     }
+}
+
+inline void BitWriter::append(const BitWriter& other) {
+    for (int i = 0; i < other.byte_pos_; ++i) write_bits(other.buf_[i], 8);
+    if (other.bits_in_buf_ > 0)
+        write_bits(static_cast<uint32_t>(other.bit_buf_ & ((1u << other.bits_in_buf_) - 1)),
+                   other.bits_in_buf_);
 }
 
 inline void BitWriter::align_to_byte() {

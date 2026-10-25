@@ -49,8 +49,9 @@ inline bool is_public(const FourCC& type) noexcept {
     return (static_cast<uint8_t>(type[1]) & 0x20) == 0;
 }
 
+// Safe-to-copy chunks have a lowercase 4th letter (bit 5 set).
 inline bool is_safe_to_copy(const FourCC& type) noexcept {
-    return (static_cast<uint8_t>(type[3]) & 0x20) == 0;
+    return (static_cast<uint8_t>(type[3]) & 0x20) != 0;
 }
 
 inline std::string fourcc_str(const FourCC& type) {
